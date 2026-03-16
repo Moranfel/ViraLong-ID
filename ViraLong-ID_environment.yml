@@ -1,0 +1,17 @@
+name: viralong-id
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - biopython
+  - matplotlib
+  - ncbi-datasets-cli
+  - blast
+  - fastplong
+  - flye
+  - mafft
+  - iqtree
+  - unzip
+  - pip
