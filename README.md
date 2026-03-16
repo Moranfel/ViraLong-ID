@@ -1,12 +1,4 @@
-🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬
-██╗   ██╗██╗██████╗  █████╗ ██╗      ██████╗ ███╗   ██╗ ██████╗       ██╗██████╗
-██║   ██║██║██╔══██╗██╔══██╗██║     ██╔═══██╗████╗  ██║██╔════╝       ██║██╔══██╗
-██║   ██║██║██████╔╝███████║██║     ██║   ██║██╔██╗ ██║██║  ███╗🧬🦠🧬 ██║██║  ██║
-╚██╗ ██╔╝██║██╔══██╗██╔══██║██║     ██║   ██║██║╚██╗██║██║   ██║      ██║██║  ██║
- ╚████╔╝ ██║██║  ██║██║  ██║███████╗╚██████╔╝██║ ╚████║╚██████╔╝      ██║██████╔╝
-  ╚═══╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝       ╚═╝╚═════╝
-🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬 By Felix Morán 🦠🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬🦠🦠🦠🧬
-
+![alt text](<Screenshot 2026-03-16 at 6.57.19 PM.png>)
 **Long-read viral identification and global phylogeny pipeline**
 
 ViraLong-ID is a command-line pipeline for **fast viral identification from long-read sequencing data** with a final **global phylogeny** built from all retained target contigs across the batch.
