@@ -99,6 +99,26 @@ mamba env create -f ViraLong-ID_v4.2.environment.yml
 mamba activate viralong-id
 ```
 
+## Download the RefSeq virus FASTA 📥
+
+ViraLong-ID requires a local viral FASTA file to build the shared BLAST database used for contig identification.
+
+One simple option is to download the RefSeq virus nucleotide FASTA directly from the NCBI FTP site:
+
+```bash
+curl -L -o viral.1.1.genomic.fna.gz https://ftp.ncbi.nlm.nih.gov/refseq/release/viral/viral.1.1.genomic.fna.gz
+gunzip viral.1.1.genomic.fna.gz
+```
+
+You can then pass it to the pipeline with:
+
+```bash
+--refseq-virus-fasta /path/to/viral.1.1.genomic.fna
+```
+
+If needed, additional viral RefSeq partitions can also be downloaded from:
+[https://ftp.ncbi.nlm.nih.gov/refseq/release/viral/](https://ftp.ncbi.nlm.nih.gov/refseq/release/viral/)
+
 ## Quick start ▶️
 
 Run the pipeline with:
