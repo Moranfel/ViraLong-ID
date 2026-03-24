@@ -51,7 +51,7 @@ except ImportError:
 
 
 PIPELINE_NAME = "ViraLong-ID"
-PIPELINE_VERSION = "4.5-batch"
+PIPELINE_VERSION = "4.8-batch"
 
 
 # ---------------------------------------------------------------------
@@ -300,6 +300,7 @@ def make_shared_layout(base: Path) -> Dict[str, Path]:
         "blast_db": base / "05_blast_database",
         "combined": base / "06_combined_target_contigs",
         "aln": base / "07_phylogeny_alignment",
+        "identity": base / "07b_pairwise_identity",
         "tree": base / "08_phylogeny_tree",
         "report": base / "09_report",
         "samples": base / "samples",
@@ -340,7 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "🧬 Long-read viral identification and phylogeny pipeline for one or more samples\n"
             "🦠 Shared references and BLAST database across the batch\n"
-            "🌳 One combined alignment with robust strand correction, trimAl filtering, and one global IQ-TREE phylogeny for all retained contigs"
+            "🌳 One combined alignment with robust strand correction, trimAl filtering, identity heatmap generation, and one global IQ-TREE phylogeny for all retained contigs"
         )
     )
     p.add_argument("--taxid", required=True, help="🧬 Target NCBI Taxonomy ID")
@@ -374,6 +375,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="✂️ trimAl gap threshold used to keep well-aligned columns")
     p.add_argument("--mafft-adjust-direction", choices=["off", "on", "accurate"], default="on",
                    help="🔄 Automatic strand correction in MAFFT")
+    p.add_argument("--identity-plot-min", type=float, default=None,
+                   help="🎨 Minimum value for pairwise identity heatmap color scale")
     return p
 
 
@@ -1080,19 +1083,145 @@ def step10_trimal(shared_layout: Dict[str, Path], gap_threshold: float) -> None:
 
 
 # ---------------------------------------------------------------------
-# Step 11 - IQ-TREE + PDF
+# Step 11 - Pairwise identity heatmap
 # ---------------------------------------------------------------------
 
-def step11_tree_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path]:
+def step11_identity_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path]:
+    matrix_tsv = shared_layout["identity"] / "pairwise_identity.tsv"
+    pdf = shared_layout["identity"] / "pairwise_identity_heatmap.pdf"
+    png = shared_layout["identity"] / "pairwise_identity_heatmap.png"
+    return matrix_tsv, pdf, png
+
+
+def step11_identity_done(shared_layout: Dict[str, Path]) -> bool:
+    matrix_tsv, pdf, png = step11_identity_outputs(shared_layout)
+    return matrix_tsv.exists() and pdf.exists() and png.exists()
+
+
+def load_alignment_records(alignment_fasta: Path):
+    return list(SeqIO.parse(str(alignment_fasta), "fasta"))
+
+
+def pairwise_identity(seq_a: str, seq_b: str) -> float:
+    matches = 0
+    compared = 0
+    for a, b in zip(seq_a.upper(), seq_b.upper()):
+        if a in "-?" or b in "-?":
+            continue
+        compared += 1
+        if a == b:
+            matches += 1
+    if compared == 0:
+        return 0.0
+    return 100.0 * matches / compared
+
+
+def compute_identity_matrix(records) -> Tuple[List[str], List[List[float]]]:
+    labels = [rec.id for rec in records]
+    seqs = [str(rec.seq) for rec in records]
+    matrix: List[List[float]] = []
+    for seq_a in seqs:
+        row = []
+        for seq_b in seqs:
+            row.append(pairwise_identity(seq_a, seq_b))
+        matrix.append(row)
+    return labels, matrix
+
+
+def reorder_matrix(labels: List[str], matrix: List[List[float]], ordered_labels: List[str]) -> Tuple[List[str], List[List[float]]]:
+    index = {label: i for i, label in enumerate(labels)}
+    keep = [label for label in ordered_labels if label in index]
+    if not keep:
+        return labels, matrix
+    reordered = []
+    for row_label in keep:
+        i = index[row_label]
+        reordered.append([matrix[i][index[col_label]] for col_label in keep])
+    return keep, reordered
+
+
+def render_identity_heatmap(labels: List[str], matrix: List[List[float]], pdf_path: Path, png_path: Path,
+                            title: str, vmin: float | None) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    off_diag = [matrix[i][j] for i in range(len(matrix)) for j in range(len(matrix)) if i != j]
+    auto_vmin = min(off_diag) if off_diag else 95.0
+    if vmin is None:
+        vmin = max(0.0, round((auto_vmin - 0.2) * 2) / 2)
+
+    n = max(1, len(labels))
+    fig_w = max(12, min(28, 4 + n * 0.42))
+    fig_h = max(10, min(28, 4 + n * 0.34))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(matrix, cmap="viridis", vmin=vmin, vmax=100.0, interpolation="nearest", aspect="auto")
+    ax.set_title(title, fontsize=14, pad=12)
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(labels, rotation=90, fontsize=8)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xticks([x - 0.5 for x in range(1, n)], minor=True)
+    ax.set_yticks([y - 0.5 for y in range(1, n)], minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=0.8)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Genome identity (%)")
+    fig.tight_layout()
+    fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
+    fig.savefig(str(png_path), format="png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def step11_identity_plot(shared_layout: Dict[str, Path], plot_min: float | None) -> None:
+    from Bio import Phylo
+
+    log_file = shared_layout["logs"] / "step11_identity_heatmap.log"
+    trimmed_alignment = step10_outputs(shared_layout)[0]
+    matrix_tsv, pdf, png = step11_identity_outputs(shared_layout)
+    treefile = step12_tree_outputs(shared_layout)[0]
+    records = load_alignment_records(trimmed_alignment)
+    if not records:
+        raise RuntimeError("Trimmed alignment is empty")
+    labels, matrix = compute_identity_matrix(records)
+    if treefile.exists():
+        tree = Phylo.read(str(treefile), "newick")
+        tree_order = [term.name for term in tree.get_terminals()]
+        labels, matrix = reorder_matrix(labels, matrix, tree_order)
+
+    with open(matrix_tsv, "w", encoding="utf-8", newline="") as out:
+        writer = csv.writer(out, delimiter="\t")
+        writer.writerow(["sequence"] + labels)
+        for label, row in zip(labels, matrix):
+            writer.writerow([label] + [f"{value:.4f}" for value in row])
+
+    render_identity_heatmap(labels, matrix, pdf, png, "CYVCV genome identity heatmap", plot_min)
+
+    with open(log_file, "a", encoding="utf-8") as logh:
+        logh.write(f"[{now()}] Pairwise identity matrix written to: {matrix_tsv}\n")
+        logh.write(f"[{now()}] Heatmap PDF written to: {pdf}\n")
+        logh.write(f"[{now()}] Heatmap PNG written to: {png}\n")
+
+
+# ---------------------------------------------------------------------
+# Step 12 - IQ-TREE + PDF
+# ---------------------------------------------------------------------
+
+def step12_tree_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path]:
     treefile = shared_layout["tree"] / "alignment_mafft.trimmed.treefile"
     iqtree = shared_layout["tree"] / "alignment_mafft.trimmed.iqtree"
     pdf = shared_layout["tree"] / "alignment_mafft.trimmed.tree.pdf"
     return treefile, iqtree, pdf
 
 
-def step11_tree_done(shared_layout: Dict[str, Path]) -> bool:
-    treefile, iqtree, pdf = step11_tree_outputs(shared_layout)
+def step12_tree_done(shared_layout: Dict[str, Path]) -> bool:
+    treefile, iqtree, pdf = step12_tree_outputs(shared_layout)
     return treefile.exists() and iqtree.exists() and pdf.exists()
+
+
+def is_assembled_tip(label: str) -> bool:
+    return "__" in label
 
 
 def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
@@ -1101,6 +1230,7 @@ def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     tree = Phylo.read(str(treefile), "newick")
     terminals = max(1, len(tree.get_terminals()))
@@ -1109,13 +1239,30 @@ def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
     fig = plt.figure(figsize=(fig_width, fig_height))
     ax = fig.add_subplot(1, 1, 1)
     Phylo.draw(tree, axes=ax, do_show=False)
+
+    for text in ax.texts:
+        label = text.get_text().strip()
+        if not label:
+            continue
+        if is_assembled_tip(label):
+            text.set_color("#c0392b")
+            text.set_fontweight("bold")
+        else:
+            text.set_color("#1f1f1f")
+
+    legend_handles = [
+        Line2D([0], [0], color="#c0392b", lw=0, marker="o", markersize=7, label="Assembled isolates"),
+        Line2D([0], [0], color="#1f1f1f", lw=0, marker="o", markersize=7, label="Reference genomes"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper right", frameon=False, fontsize=9)
+
     fig.tight_layout()
     fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
     plt.close(fig)
 
 
-def step11_iqtree(shared_layout: Dict[str, Path], threads: int) -> None:
-    log_file = shared_layout["logs"] / "step11_iqtree.log"
+def step12_iqtree(shared_layout: Dict[str, Path], threads: int) -> None:
+    log_file = shared_layout["logs"] / "step12_iqtree.log"
     aln = step10_outputs(shared_layout)[0]
     prefix = shared_layout["tree"] / "alignment_mafft.trimmed"
 
@@ -1131,14 +1278,14 @@ def step11_iqtree(shared_layout: Dict[str, Path], threads: int) -> None:
         log_file
     )
 
-    treefile, iqtree_txt, pdf = step11_tree_outputs(shared_layout)
+    treefile, iqtree_txt, pdf = step12_tree_outputs(shared_layout)
     if not treefile.exists() or not iqtree_txt.exists():
         raise RuntimeError("IQ-TREE output not found")
     render_tree_pdf(treefile, pdf)
 
 
 # ---------------------------------------------------------------------
-# Step 12 - Reports
+# Step 13 - Reports
 # ---------------------------------------------------------------------
 
 def step11_outputs(sample_layout: Dict[str, Path]) -> Tuple[Path, Path]:
@@ -1170,7 +1317,8 @@ def sample_summary_row(sample_layout: Dict[str, Path], shared_layout: Dict[str, 
     target_contigs = step8_outputs(sample_layout)[0]
     preselect_stats = step5_outputs(sample_layout)[1]
     trimmed_alignment, _ = step10_outputs(shared_layout)
-    treefile, _, tree_pdf = step11_tree_outputs(shared_layout)
+    identity_tsv, identity_pdf, _ = step11_identity_outputs(shared_layout)
+    treefile, _, tree_pdf = step12_tree_outputs(shared_layout)
 
     reads_in = count_fastq_reads(reads)
     reads_qc = count_fastq_reads(step3_outputs(sample_layout, min_q)[0])
@@ -1200,6 +1348,8 @@ def sample_summary_row(sample_layout: Dict[str, Path], shared_layout: Dict[str, 
         "n_target_contigs": str(len(tgt_lengths)),
         "best_hit": best_hit_from_top_hits(step7_outputs(sample_layout)[1]),
         "trimmed_alignment": str(trimmed_alignment),
+        "identity_matrix": str(identity_tsv),
+        "identity_heatmap": str(identity_pdf),
         "treefile": str(treefile),
         "tree_pdf": str(tree_pdf),
     }
@@ -1213,7 +1363,8 @@ def step11_report(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path]
     fields = [
         "sample", "taxid", "reads_input", "reads_after_qc", "reads_for_assembly",
         "assembly_selected_coverage", "n_complete_refs", "n_assembly_contigs",
-        "n_target_contigs", "best_hit", "trimmed_alignment", "treefile", "tree_pdf"
+        "n_target_contigs", "best_hit", "trimmed_alignment", "identity_matrix",
+        "identity_heatmap", "treefile", "tree_pdf"
     ]
     with open(summary_tsv, "w", encoding="utf-8", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=fields, delimiter="\t")
@@ -1239,6 +1390,8 @@ def step11_report(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path]
     - Target contigs: 06_taxon_filtered_contigs/contigs_target_taxon.fasta
     - Global alignment: {step9_outputs(shared_layout)[4]}
     - Trimmed alignment: {row['trimmed_alignment']}
+    - Pairwise identity matrix: {row['identity_matrix']}
+    - Pairwise identity heatmap: {row['identity_heatmap']}
     - Global tree: {row['treefile']}
     - Global tree PDF: {row['tree_pdf']}
     """)
@@ -1307,7 +1460,8 @@ def write_batch_summary(outdir: Path, rows: List[Dict[str, str]]) -> Tuple[Path,
     fields = [
         "sample", "taxid", "reads_input", "reads_after_qc", "reads_for_assembly",
         "assembly_selected_coverage", "n_complete_refs", "n_assembly_contigs",
-        "n_target_contigs", "best_hit", "trimmed_alignment", "treefile", "tree_pdf"
+        "n_target_contigs", "best_hit", "trimmed_alignment", "identity_matrix",
+        "identity_heatmap", "treefile", "tree_pdf"
     ]
     with open(summary_tsv, "w", encoding="utf-8", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=fields, delimiter="\t")
@@ -1326,6 +1480,8 @@ def write_batch_summary(outdir: Path, rows: List[Dict[str, str]]) -> Tuple[Path,
             f"- {row['sample']}: target_contigs={row['n_target_contigs']}, assembly_contigs={row['n_assembly_contigs']}",
             f"  Best hit: {row['best_hit']}",
             f"  Trimmed alignment: {row['trimmed_alignment']}",
+            f"  Identity matrix: {row['identity_matrix']}",
+            f"  Identity heatmap: {row['identity_heatmap']}",
             f"  Tree: {row['treefile']}",
             f"  Tree PDF: {row['tree_pdf']}",
             "",
@@ -1436,8 +1592,11 @@ def run_global_phylogeny(shared_layout: Dict[str, Path], sample_layouts: List[Di
              lambda: step10_done(shared_layout),
              lambda: step10_trimal(shared_layout, args.trimal_gap_threshold)),
         Step("Infer batch ML tree and render PDF",
-             lambda: step11_tree_done(shared_layout),
-             lambda: step11_iqtree(shared_layout, args.threads)),
+             lambda: step12_tree_done(shared_layout),
+             lambda: step12_iqtree(shared_layout, args.threads)),
+        Step("Build pairwise identity heatmap",
+             lambda: step11_identity_done(shared_layout),
+             lambda: step11_identity_plot(shared_layout, args.identity_plot_min)),
     ]
 
     print_section("Global phylogeny")
@@ -1483,13 +1642,16 @@ def run_pipeline(args) -> None:
 
     batch_summary_tsv, batch_summary_txt = write_batch_summary(args.outdir, batch_rows)
     trimmed_alignment, _ = step10_outputs(shared_layout)
-    treefile, _, tree_pdf = step11_tree_outputs(shared_layout)
+    identity_tsv, identity_pdf, _ = step11_identity_outputs(shared_layout)
+    treefile, _, tree_pdf = step12_tree_outputs(shared_layout)
 
     print()
     print_banner("Batch Completed", f"{len(batch_rows)} sample(s) processed successfully")
     print_status_line("Global summary", summarize_path(batch_summary_txt), "green")
     print_status_line("Global table", summarize_path(batch_summary_tsv), "green")
     print_status_line("Trimmed alignment", summarize_path(trimmed_alignment), "green")
+    print_status_line("Identity matrix", summarize_path(identity_tsv), "green")
+    print_status_line("Identity heatmap", summarize_path(identity_pdf), "green")
     print_status_line("Global tree", summarize_path(treefile), "green")
     print_status_line("Global tree PDF", summarize_path(tree_pdf), "green")
 
