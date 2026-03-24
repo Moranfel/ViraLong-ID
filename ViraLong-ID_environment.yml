@@ -12,6 +12,7 @@ dependencies:
   - fastplong
   - flye
   - mafft
+  - trimal
   - iqtree
   - unzip
   - pip
