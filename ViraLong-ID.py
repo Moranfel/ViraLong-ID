@@ -51,7 +51,7 @@ except ImportError:
 
 
 PIPELINE_NAME = "ViraLong-ID"
-PIPELINE_VERSION = "4.8-batch"
+PIPELINE_VERSION = "5.0-batch"
 
 
 # ---------------------------------------------------------------------
@@ -69,6 +69,10 @@ def eprint(msg: str) -> None:
 def die(msg: str, code: int = 1) -> None:
     eprint(f"[{now()}] ERROR: {msg}")
     sys.exit(code)
+
+
+def warn(msg: str) -> None:
+    eprint(f"[{now()}] WARNING: {msg}")
 
 
 def require_executable(name: str) -> None:
@@ -153,12 +157,35 @@ def count_fastq_reads(path: Path) -> int:
     if not path.exists():
         return 0
     n_lines = 0
-    with open_maybe_gz(path, "rt") as fh:
-        for n_lines, _ in enumerate(fh, start=1):
-            pass
+    try:
+        with open_maybe_gz(path, "rt") as fh:
+            for n_lines, _ in enumerate(fh, start=1):
+                pass
+    except (EOFError, OSError):
+        return 0
     if n_lines == 0:
         return 0
     return n_lines // 4
+
+
+def fastq_output_usable(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    return count_fastq_reads(path) > 0
+
+
+def ensure_no_corrupt_fastq(path: Path, log_file: Path | None = None) -> None:
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    if fastq_output_usable(path):
+        return
+    warn(f"Detected an unreadable or truncated FASTQ output at {path}. It will be regenerated.")
+    if log_file is not None:
+        with open(log_file, "a", encoding="utf-8") as logh:
+            logh.write(
+                f"[{now()}] WARNING: Existing FASTQ output is unreadable or truncated and will be regenerated: {path}\n"
+            )
+    path.unlink(missing_ok=True)
 
 
 def mean_phred(qualities: List[int]) -> float:
@@ -504,26 +531,41 @@ def step3_outputs(layout: Dict[str, Path], min_q: int) -> Tuple[Path, Path, Path
 
 def step3_done(layout: Dict[str, Path], min_q: int) -> bool:
     fq, html, js = step3_outputs(layout, min_q)
-    return fq.exists() and html.exists() and js.exists()
+    return fastq_output_usable(fq)
 
 
 def step3_qc_reads(layout: Dict[str, Path], reads: Path, min_q: int, threads: int) -> None:
     log_file = layout["logs"] / "step03_qc_reads.log"
     fq, html, js = step3_outputs(layout, min_q)
-    run_logged(
-        [
-            "fastplong",
-            "-i", str(reads),
-            "-o", str(fq),
-            "-m", str(min_q),
-            "-w", str(threads),
-            "-h", str(html),
-            "-j", str(js),
-        ],
-        log_file
-    )
-    if not fq.exists():
-        raise RuntimeError("fastplong output FASTQ not found")
+    ensure_no_corrupt_fastq(fq, log_file)
+    cmd = [
+        "fastplong",
+        "-i", str(reads),
+        "-o", str(fq),
+        "-m", str(min_q),
+        "-w", str(threads),
+        "-h", str(html),
+        "-j", str(js),
+    ]
+
+    try:
+        run_logged(cmd, log_file)
+    except Exception:
+        if fastq_output_usable(fq):
+            warn(
+                f"fastplong reported an error for {reads.name}, but a usable filtered FASTQ was produced. "
+                "Continuing without HTML/JSON QC reports."
+            )
+            with open(log_file, "a", encoding="utf-8") as logh:
+                logh.write(
+                    f"[{now()}] WARNING: fastplong exited with an error code, "
+                    "but reads.Q*.fastq.gz was produced and will be used.\n"
+                )
+            return
+        raise
+
+    if not fastq_output_usable(fq):
+        raise RuntimeError("fastplong output FASTQ not found or empty")
 
 
 # ---------------------------------------------------------------------
