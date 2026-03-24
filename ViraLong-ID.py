@@ -51,7 +51,7 @@ except ImportError:
 
 
 PIPELINE_NAME = "ViraLong-ID"
-PIPELINE_VERSION = "4.1-batch"
+PIPELINE_VERSION = "4.5-batch"
 
 
 # ---------------------------------------------------------------------
@@ -281,6 +281,14 @@ def sample_name_from_reads(path: Path) -> str:
     return sanitize_field(strip_fastq_suffix(path)) or "sample"
 
 
+def mafft_direction_flag(mode: str) -> List[str]:
+    if mode == "accurate":
+        return ["--adjustdirectionaccurately"]
+    if mode == "on":
+        return ["--adjustdirection"]
+    return []
+
+
 # ---------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------
@@ -332,7 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "🧬 Long-read viral identification and phylogeny pipeline for one or more samples\n"
             "🦠 Shared references and BLAST database across the batch\n"
-            "🌳 One combined alignment and one global IQ-TREE phylogeny for all retained contigs"
+            "🌳 One combined alignment with robust strand correction, trimAl filtering, and one global IQ-TREE phylogeny for all retained contigs"
         )
     )
     p.add_argument("--taxid", required=True, help="🧬 Target NCBI Taxonomy ID")
@@ -362,6 +370,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help='📏 Maximum read length for assembly preselection, or "auto"')
     p.add_argument("--assembly-target-cov", type=int, default=300,
                    help="🧮 Target effective coverage used to cap input for Flye")
+    p.add_argument("--trimal-gap-threshold", type=float, default=0.8,
+                   help="✂️ trimAl gap threshold used to keep well-aligned columns")
+    p.add_argument("--mafft-adjust-direction", choices=["off", "on", "accurate"], default="on",
+                   help="🔄 Automatic strand correction in MAFFT")
     return p
 
 
@@ -919,16 +931,18 @@ def step8_select_target_contigs(sample_layout: Dict[str, Path], shared_layout: D
 # Step 9 - Combined contigs and MAFFT
 # ---------------------------------------------------------------------
 
-def step9_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path]:
+def step9_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path, Path, Path]:
     combined = shared_layout["combined"] / "all_target_contigs.fasta"
+    guide = shared_layout["aln"] / "direction_guide_plus_contigs.fasta"
+    oriented = shared_layout["aln"] / "all_target_contigs.oriented.fasta"
     dataset = shared_layout["aln"] / "sequences_for_phylogeny.fasta"
     aln = shared_layout["aln"] / "alignment_mafft.fasta"
-    return combined, dataset, aln
+    return combined, guide, oriented, dataset, aln
 
 
 def step9_done(shared_layout: Dict[str, Path]) -> bool:
-    combined, dataset, aln = step9_outputs(shared_layout)
-    return combined.exists() and dataset.exists() and aln.exists()
+    combined, _, oriented, dataset, aln = step9_outputs(shared_layout)
+    return combined.exists() and oriented.exists() and dataset.exists() and aln.exists()
 
 
 def concatenate_fastas(files: List[Path], out_fasta: Path) -> int:
@@ -942,10 +956,11 @@ def concatenate_fastas(files: List[Path], out_fasta: Path) -> int:
     return len(records)
 
 
-def step9_collect_and_align(shared_layout: Dict[str, Path], sample_layouts: List[Dict[str, Path]], threads: int) -> None:
+def step9_collect_and_align(shared_layout: Dict[str, Path], sample_layouts: List[Dict[str, Path]], threads: int,
+                            adjust_direction: str) -> None:
     log_file = shared_layout["logs"] / "step09_mafft.log"
     renamed_refs = step2_outputs(shared_layout)[2]
-    combined_contigs, dataset, aln = step9_outputs(shared_layout)
+    combined_contigs, direction_guide, oriented_contigs, dataset, aln = step9_outputs(shared_layout)
     ref_aln = shared_layout["aln"] / "reference_alignment.fasta"
 
     target_fastas = [step8_outputs(sample_layout)[0] for sample_layout in sample_layouts]
@@ -953,11 +968,10 @@ def step9_collect_and_align(shared_layout: Dict[str, Path], sample_layouts: List
     if n_contigs == 0:
         raise RuntimeError("No target contigs were retained across the batch")
 
-    concatenate_fastas([renamed_refs, combined_contigs], dataset)
-
     cmd1 = [
         "mafft",
         "--thread", str(threads),
+        *mafft_direction_flag(adjust_direction),
         "--auto",
         str(renamed_refs)
     ]
@@ -967,11 +981,57 @@ def step9_collect_and_align(shared_layout: Dict[str, Path], sample_layouts: List
         if proc.returncode != 0:
             raise RuntimeError("MAFFT reference alignment failed")
 
+    if adjust_direction == "off":
+        shutil.copyfile(str(combined_contigs), str(oriented_contigs))
+    else:
+        first_ref = None
+        for rec in SeqIO.parse(str(renamed_refs), "fasta"):
+            first_ref = rec
+            break
+        if first_ref is None:
+            raise RuntimeError("Reference FASTA is empty")
+
+        with open(direction_guide, "w", encoding="utf-8") as out:
+            SeqIO.write([first_ref], out, "fasta")
+            for rec in SeqIO.parse(str(combined_contigs), "fasta"):
+                SeqIO.write([rec], out, "fasta")
+
+        cmd_orient = [
+            "mafft",
+            "--thread", str(threads),
+            *mafft_direction_flag(adjust_direction),
+            "--auto",
+            str(direction_guide)
+        ]
+        oriented_full = shared_layout["aln"] / "direction_guide_plus_contigs.aligned.fasta"
+        with open(oriented_full, "w", encoding="utf-8") as out, open(log_file, "a", encoding="utf-8") as logh:
+            logh.write(f"\n[{now()}] CMD: {' '.join(cmd_orient)}\n")
+            proc = subprocess.run(cmd_orient, stdout=out, stderr=logh, text=True, check=False)
+            if proc.returncode != 0:
+                raise RuntimeError("MAFFT strand correction failed")
+
+        oriented_records = []
+        for rec in SeqIO.parse(str(oriented_full), "fasta"):
+            if rec.id == first_ref.id or rec.id.startswith("_R_" + first_ref.id):
+                continue
+            seq = str(rec.seq).replace("-", "")
+            rec.seq = rec.seq.__class__(seq)
+            rec.id = rec.id.removeprefix("_R_")
+            rec.name = rec.id
+            rec.description = ""
+            oriented_records.append(rec)
+
+        if not oriented_records:
+            raise RuntimeError("No oriented contigs were produced for MAFFT")
+        SeqIO.write(oriented_records, str(oriented_contigs), "fasta")
+
+    concatenate_fastas([renamed_refs, oriented_contigs], dataset)
+
     cmd2 = [
         "mafft",
         "--thread", str(threads),
         "--reorder",
-        "--addfragments", str(combined_contigs),
+        "--addfragments", str(oriented_contigs),
         str(ref_aln)
     ]
     with open(aln, "w", encoding="utf-8") as out, open(log_file, "a", encoding="utf-8") as logh:
@@ -985,18 +1045,53 @@ def step9_collect_and_align(shared_layout: Dict[str, Path], sample_layouts: List
 
 
 # ---------------------------------------------------------------------
-# Step 10 - IQ-TREE + PDF
+# Step 10 - trimAl
 # ---------------------------------------------------------------------
 
-def step10_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path]:
-    treefile = shared_layout["tree"] / "alignment_mafft.treefile"
-    iqtree = shared_layout["tree"] / "alignment_mafft.iqtree"
-    pdf = shared_layout["tree"] / "alignment_mafft.tree.pdf"
-    return treefile, iqtree, pdf
+def step10_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path]:
+    trimmed = shared_layout["aln"] / "alignment_mafft.trimmed.fasta"
+    html = shared_layout["aln"] / "alignment_mafft.trimmed.html"
+    return trimmed, html
 
 
 def step10_done(shared_layout: Dict[str, Path]) -> bool:
-    treefile, iqtree, pdf = step10_outputs(shared_layout)
+    trimmed, _ = step10_outputs(shared_layout)
+    return trimmed.exists() and trimmed.stat().st_size > 0
+
+
+def step10_trimal(shared_layout: Dict[str, Path], gap_threshold: float) -> None:
+    log_file = shared_layout["logs"] / "step10_trimal.log"
+    aln = step9_outputs(shared_layout)[4]
+    trimmed, html = step10_outputs(shared_layout)
+
+    run_logged(
+        [
+            "trimal",
+            "-in", str(aln),
+            "-out", str(trimmed),
+            "-htmlout", str(html),
+            "-gt", str(gap_threshold),
+        ],
+        log_file
+    )
+
+    if not trimmed.exists() or trimmed.stat().st_size == 0:
+        raise RuntimeError("trimAl did not produce a trimmed alignment")
+
+
+# ---------------------------------------------------------------------
+# Step 11 - IQ-TREE + PDF
+# ---------------------------------------------------------------------
+
+def step11_tree_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path]:
+    treefile = shared_layout["tree"] / "alignment_mafft.trimmed.treefile"
+    iqtree = shared_layout["tree"] / "alignment_mafft.trimmed.iqtree"
+    pdf = shared_layout["tree"] / "alignment_mafft.trimmed.tree.pdf"
+    return treefile, iqtree, pdf
+
+
+def step11_tree_done(shared_layout: Dict[str, Path]) -> bool:
+    treefile, iqtree, pdf = step11_tree_outputs(shared_layout)
     return treefile.exists() and iqtree.exists() and pdf.exists()
 
 
@@ -1019,10 +1114,10 @@ def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
     plt.close(fig)
 
 
-def step10_iqtree(shared_layout: Dict[str, Path], threads: int) -> None:
-    log_file = shared_layout["logs"] / "step10_iqtree.log"
-    aln = step9_outputs(shared_layout)[2]
-    prefix = shared_layout["tree"] / "alignment_mafft"
+def step11_iqtree(shared_layout: Dict[str, Path], threads: int) -> None:
+    log_file = shared_layout["logs"] / "step11_iqtree.log"
+    aln = step10_outputs(shared_layout)[0]
+    prefix = shared_layout["tree"] / "alignment_mafft.trimmed"
 
     run_logged(
         [
@@ -1036,14 +1131,14 @@ def step10_iqtree(shared_layout: Dict[str, Path], threads: int) -> None:
         log_file
     )
 
-    treefile, iqtree_txt, pdf = step10_outputs(shared_layout)
+    treefile, iqtree_txt, pdf = step11_tree_outputs(shared_layout)
     if not treefile.exists() or not iqtree_txt.exists():
         raise RuntimeError("IQ-TREE output not found")
     render_tree_pdf(treefile, pdf)
 
 
 # ---------------------------------------------------------------------
-# Step 11 - Reports
+# Step 12 - Reports
 # ---------------------------------------------------------------------
 
 def step11_outputs(sample_layout: Dict[str, Path]) -> Tuple[Path, Path]:
@@ -1074,7 +1169,8 @@ def sample_summary_row(sample_layout: Dict[str, Path], shared_layout: Dict[str, 
     assembly_fasta = step6_outputs(sample_layout)
     target_contigs = step8_outputs(sample_layout)[0]
     preselect_stats = step5_outputs(sample_layout)[1]
-    treefile, _, tree_pdf = step10_outputs(shared_layout)
+    trimmed_alignment, _ = step10_outputs(shared_layout)
+    treefile, _, tree_pdf = step11_tree_outputs(shared_layout)
 
     reads_in = count_fastq_reads(reads)
     reads_qc = count_fastq_reads(step3_outputs(sample_layout, min_q)[0])
@@ -1103,6 +1199,7 @@ def sample_summary_row(sample_layout: Dict[str, Path], shared_layout: Dict[str, 
         "n_assembly_contigs": str(len(asm_lengths)),
         "n_target_contigs": str(len(tgt_lengths)),
         "best_hit": best_hit_from_top_hits(step7_outputs(sample_layout)[1]),
+        "trimmed_alignment": str(trimmed_alignment),
         "treefile": str(treefile),
         "tree_pdf": str(tree_pdf),
     }
@@ -1116,7 +1213,7 @@ def step11_report(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path]
     fields = [
         "sample", "taxid", "reads_input", "reads_after_qc", "reads_for_assembly",
         "assembly_selected_coverage", "n_complete_refs", "n_assembly_contigs",
-        "n_target_contigs", "best_hit", "treefile", "tree_pdf"
+        "n_target_contigs", "best_hit", "trimmed_alignment", "treefile", "tree_pdf"
     ]
     with open(summary_tsv, "w", encoding="utf-8", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=fields, delimiter="\t")
@@ -1140,7 +1237,8 @@ def step11_report(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path]
     Main outputs:
     - Assembly input subset: 03b_reads_for_assembly/reads.assembly_subset.fastq.gz
     - Target contigs: 06_taxon_filtered_contigs/contigs_target_taxon.fasta
-    - Global alignment: {step9_outputs(shared_layout)[2]}
+    - Global alignment: {step9_outputs(shared_layout)[4]}
+    - Trimmed alignment: {row['trimmed_alignment']}
     - Global tree: {row['treefile']}
     - Global tree PDF: {row['tree_pdf']}
     """)
@@ -1164,7 +1262,7 @@ class Step:
 def validate_shared_inputs(args) -> None:
     if SeqIO is None:
         die("Biopython is not installed. Please install it in your environment before running the pipeline.")
-    for exe in ["datasets", "dataformat", "unzip", "fastplong", "flye", "makeblastdb", "blastn", "mafft", "iqtree"]:
+    for exe in ["datasets", "dataformat", "unzip", "fastplong", "flye", "makeblastdb", "blastn", "mafft", "trimal", "iqtree"]:
         require_executable(exe)
 
     if not args.refseq_virus_fasta.exists():
@@ -1209,7 +1307,7 @@ def write_batch_summary(outdir: Path, rows: List[Dict[str, str]]) -> Tuple[Path,
     fields = [
         "sample", "taxid", "reads_input", "reads_after_qc", "reads_for_assembly",
         "assembly_selected_coverage", "n_complete_refs", "n_assembly_contigs",
-        "n_target_contigs", "best_hit", "treefile", "tree_pdf"
+        "n_target_contigs", "best_hit", "trimmed_alignment", "treefile", "tree_pdf"
     ]
     with open(summary_tsv, "w", encoding="utf-8", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=fields, delimiter="\t")
@@ -1227,6 +1325,7 @@ def write_batch_summary(outdir: Path, rows: List[Dict[str, str]]) -> Tuple[Path,
         lines.extend([
             f"- {row['sample']}: target_contigs={row['n_target_contigs']}, assembly_contigs={row['n_assembly_contigs']}",
             f"  Best hit: {row['best_hit']}",
+            f"  Trimmed alignment: {row['trimmed_alignment']}",
             f"  Tree: {row['treefile']}",
             f"  Tree PDF: {row['tree_pdf']}",
             "",
@@ -1330,10 +1429,15 @@ def run_global_phylogeny(shared_layout: Dict[str, Path], sample_layouts: List[Di
     steps = [
         Step("Combine target contigs and build MAFFT alignment",
              lambda: step9_done(shared_layout),
-             lambda: step9_collect_and_align(shared_layout, sample_layouts, args.threads)),
-        Step("Infer batch ML tree and render PDF",
+             lambda: step9_collect_and_align(
+                 shared_layout, sample_layouts, args.threads, args.mafft_adjust_direction
+             )),
+        Step("Trim alignment with trimAl",
              lambda: step10_done(shared_layout),
-             lambda: step10_iqtree(shared_layout, args.threads)),
+             lambda: step10_trimal(shared_layout, args.trimal_gap_threshold)),
+        Step("Infer batch ML tree and render PDF",
+             lambda: step11_tree_done(shared_layout),
+             lambda: step11_iqtree(shared_layout, args.threads)),
     ]
 
     print_section("Global phylogeny")
@@ -1361,6 +1465,7 @@ def run_pipeline(args) -> None:
     print_status_line("Samples detected", str(len(sample_jobs)), "green")
     print_status_line("Threads", str(args.threads))
     print_status_line("RefSeq virus FASTA", summarize_path(args.refseq_virus_fasta))
+    print_status_line("MAFFT strand correction", args.mafft_adjust_direction, "green")
     print_status_line("External tool output", "hidden in 00_logs/", "blue")
 
     run_global_setup(shared_layout, args)
@@ -1377,12 +1482,14 @@ def run_pipeline(args) -> None:
         batch_rows.append(step11_report(sample_layout, shared_layout, args.taxid, job.reads, args.min_q, job.sample_name))
 
     batch_summary_tsv, batch_summary_txt = write_batch_summary(args.outdir, batch_rows)
-    treefile, _, tree_pdf = step10_outputs(shared_layout)
+    trimmed_alignment, _ = step10_outputs(shared_layout)
+    treefile, _, tree_pdf = step11_tree_outputs(shared_layout)
 
     print()
     print_banner("Batch Completed", f"{len(batch_rows)} sample(s) processed successfully")
     print_status_line("Global summary", summarize_path(batch_summary_txt), "green")
     print_status_line("Global table", summarize_path(batch_summary_tsv), "green")
+    print_status_line("Trimmed alignment", summarize_path(trimmed_alignment), "green")
     print_status_line("Global tree", summarize_path(treefile), "green")
     print_status_line("Global tree PDF", summarize_path(tree_pdf), "green")
 
