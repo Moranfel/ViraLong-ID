@@ -51,7 +51,7 @@ except ImportError:
 
 
 PIPELINE_NAME = "ViraLong-ID"
-PIPELINE_VERSION = "5.0-batch"
+PIPELINE_VERSION = "5.3-batch"
 
 
 # ---------------------------------------------------------------------
@@ -172,6 +172,12 @@ def fastq_output_usable(path: Path) -> bool:
     if not path.exists() or path.stat().st_size == 0:
         return False
     return count_fastq_reads(path) > 0
+
+
+def count_fasta_records(path: Path) -> int:
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    return sum(1 for _ in SeqIO.parse(str(path), "fasta"))
 
 
 def ensure_no_corrupt_fastq(path: Path, log_file: Path | None = None) -> None:
@@ -382,8 +388,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", type=int, default=8, help="🧵 Threads")
     p.add_argument("--min-q", type=int, default=15,
                    help="✨ Minimum mean read quality for fastplong")
-    p.add_argument("--flye-mode", choices=["normal", "meta"], default="normal",
+    p.add_argument("--flye-mode", choices=["normal", "meta"], default="meta",
                    help="🧱 Flye mode")
+    p.add_argument("--flye-iterations", type=int, default=1,
+                   help="🔁 Flye polishing iterations")
     p.add_argument("--min-pident", type=float, default=70.0,
                    help="🎯 Minimum BLAST identity for target contig selection")
     p.add_argument("--min-qcov", type=float, default=40.0,
@@ -398,6 +406,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help='📏 Maximum read length for assembly preselection, or "auto"')
     p.add_argument("--assembly-target-cov", type=int, default=300,
                    help="🧮 Target effective coverage used to cap input for Flye")
+    p.add_argument("--assembly-retry-all-qc", action=argparse.BooleanOptionalAction, default=True,
+                   help="🛟 Retry failed assemblies with all QC-passed reads when no target contigs are detected")
     p.add_argument("--trimal-gap-threshold", type=float, default=0.8,
                    help="✂️ trimAl gap threshold used to keep well-aligned columns")
     p.add_argument("--mafft-adjust-direction", choices=["off", "on", "accurate"], default="on",
@@ -764,10 +774,20 @@ def step6_done(sample_layout: Dict[str, Path]) -> bool:
     return step6_outputs(sample_layout).exists()
 
 
-def step6_assemble(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path], threads: int, flye_mode: str) -> None:
+def reset_sample_assembly_outputs(sample_layout: Dict[str, Path]) -> None:
+    shutil.rmtree(sample_layout["assembly"], ignore_errors=True)
+    shutil.rmtree(sample_layout["blast"], ignore_errors=True)
+    shutil.rmtree(sample_layout["target"], ignore_errors=True)
+    mkdir(sample_layout["assembly"])
+    mkdir(sample_layout["blast"])
+    mkdir(sample_layout["target"])
+
+
+def step6_assemble(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path], threads: int, flye_mode: str,
+                   reads_for_flye: Path | None = None, iterations: int = 1) -> None:
     log_file = sample_layout["logs"] / "step06_flye.log"
     renamed_refs = step2_outputs(shared_layout)[2]
-    subset_fastq = step5_outputs(sample_layout)[0]
+    subset_fastq = reads_for_flye or step5_outputs(sample_layout)[0]
     assembly_fasta = step6_outputs(sample_layout)
 
     ref_lengths = fasta_lengths(renamed_refs)
@@ -781,6 +801,7 @@ def step6_assemble(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path
         "--out-dir", str(sample_layout["assembly"]),
         "--threads", str(threads),
         "--genome-size", parse_flye_genome_size(max_ref),
+        "--iterations", str(iterations),
     ]
     if flye_mode == "meta":
         cmd.append("--meta")
@@ -931,7 +952,7 @@ def get_target_accessions(renamed_refs: Path) -> set:
 
 
 def step8_select_target_contigs(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path], min_pident: float, min_qcov: float,
-                                min_contig_len_phylo: int, sample_name: str) -> None:
+                                sample_name: str) -> None:
     log_file = sample_layout["logs"] / "step08_target_contigs.log"
     renamed_refs = step2_outputs(shared_layout)[2]
     top_hits_tsv = step7_outputs(sample_layout)[1]
@@ -952,7 +973,7 @@ def step8_select_target_contigs(sample_layout: Dict[str, Path], shared_layout: D
 
     out_records = []
     for rec in SeqIO.parse(str(assembly_fasta), "fasta"):
-        if rec.id in keep_ids and len(rec.seq) >= min_contig_len_phylo:
+        if rec.id in keep_ids:
             rec.id = f"{sample_name}__{rec.id}"
             rec.name = rec.id
             rec.description = ""
@@ -970,6 +991,33 @@ def step8_select_target_contigs(sample_layout: Dict[str, Path], shared_layout: D
 
     with open(log_file, "a", encoding="utf-8") as logh:
         logh.write(f"[{now()}] Retained target contigs: {len(out_records)}\n")
+
+
+def rescue_sample_with_all_qc_reads(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path], sample_name: str,
+                                    min_q: int, threads: int, min_pident: float, min_qcov: float,
+                                    flye_iterations: int) -> bool:
+    log_file = sample_layout["logs"] / "step06_flye.log"
+    qc_reads = step3_outputs(sample_layout, min_q)[0]
+    if not fastq_output_usable(qc_reads):
+        return False
+
+    reset_sample_assembly_outputs(sample_layout)
+    with open(log_file, "a", encoding="utf-8") as logh:
+        logh.write(
+            f"[{now()}] Rescue mode: retrying assembly with all QC-passed reads using Flye meta mode.\n"
+        )
+
+    step6_assemble(
+        sample_layout,
+        shared_layout,
+        threads,
+        "meta",
+        reads_for_flye=qc_reads,
+        iterations=flye_iterations,
+    )
+    step7_blast(sample_layout, shared_layout, threads)
+    step8_select_target_contigs(sample_layout, shared_layout, min_pident, min_qcov, sample_name)
+    return count_fasta_records(step8_outputs(sample_layout)[0]) > 0
 
 
 # ---------------------------------------------------------------------
@@ -990,28 +1038,39 @@ def step9_done(shared_layout: Dict[str, Path]) -> bool:
     return combined.exists() and oriented.exists() and dataset.exists() and aln.exists()
 
 
-def concatenate_fastas(files: List[Path], out_fasta: Path) -> int:
+def concatenate_fastas(files: List[Path], out_fasta: Path, min_len: int = 0) -> int:
     records = []
     for f in files:
         if not f.exists() or f.stat().st_size == 0:
             continue
         for rec in SeqIO.parse(str(f), "fasta"):
+            if len(rec.seq) < min_len:
+                continue
             records.append(rec)
     SeqIO.write(records, str(out_fasta), "fasta")
     return len(records)
 
 
 def step9_collect_and_align(shared_layout: Dict[str, Path], sample_layouts: List[Dict[str, Path]], threads: int,
-                            adjust_direction: str) -> None:
+                            adjust_direction: str, min_contig_len_phylo: int) -> None:
     log_file = shared_layout["logs"] / "step09_mafft.log"
     renamed_refs = step2_outputs(shared_layout)[2]
     combined_contigs, direction_guide, oriented_contigs, dataset, aln = step9_outputs(shared_layout)
     ref_aln = shared_layout["aln"] / "reference_alignment.fasta"
 
     target_fastas = [step8_outputs(sample_layout)[0] for sample_layout in sample_layouts]
-    n_contigs = concatenate_fastas(target_fastas, combined_contigs)
+    total_target_contigs = sum(
+        1 for fasta in target_fastas if fasta.exists() for _ in SeqIO.parse(str(fasta), "fasta")
+    )
+    n_contigs = concatenate_fastas(target_fastas, combined_contigs, min_len=min_contig_len_phylo)
     if n_contigs == 0:
-        raise RuntimeError("No target contigs were retained across the batch")
+        raise RuntimeError(
+            "No target contigs passed the phylogeny length filter across the batch. "
+            "Try lowering --min-contig-len-phylo."
+        )
+    with open(log_file, "a", encoding="utf-8") as logh:
+        logh.write(f"[{now()}] Target contigs detected across batch: {total_target_contigs}\n")
+        logh.write(f"[{now()}] Target contigs retained for phylogeny (>= {min_contig_len_phylo} bp): {n_contigs}\n")
 
     cmd1 = [
         "mafft",
@@ -1128,16 +1187,26 @@ def step10_trimal(shared_layout: Dict[str, Path], gap_threshold: float) -> None:
 # Step 11 - Pairwise identity heatmap
 # ---------------------------------------------------------------------
 
-def step11_identity_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path]:
+def step11_identity_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path, Path, Path, Path]:
     matrix_tsv = shared_layout["identity"] / "pairwise_identity.tsv"
     pdf = shared_layout["identity"] / "pairwise_identity_heatmap.pdf"
     png = shared_layout["identity"] / "pairwise_identity_heatmap.png"
-    return matrix_tsv, pdf, png
+    assembled_matrix_tsv = shared_layout["identity"] / "pairwise_identity_assembled_only.tsv"
+    assembled_pdf = shared_layout["identity"] / "pairwise_identity_assembled_only_heatmap.pdf"
+    assembled_png = shared_layout["identity"] / "pairwise_identity_assembled_only_heatmap.png"
+    return matrix_tsv, pdf, png, assembled_matrix_tsv, assembled_pdf, assembled_png
 
 
 def step11_identity_done(shared_layout: Dict[str, Path]) -> bool:
-    matrix_tsv, pdf, png = step11_identity_outputs(shared_layout)
-    return matrix_tsv.exists() and pdf.exists() and png.exists()
+    matrix_tsv, pdf, png, assembled_matrix_tsv, assembled_pdf, assembled_png = step11_identity_outputs(shared_layout)
+    return (
+        matrix_tsv.exists()
+        and pdf.exists()
+        and png.exists()
+        and assembled_matrix_tsv.exists()
+        and assembled_pdf.exists()
+        and assembled_png.exists()
+    )
 
 
 def load_alignment_records(alignment_fasta: Path):
@@ -1182,6 +1251,24 @@ def reorder_matrix(labels: List[str], matrix: List[List[float]], ordered_labels:
     return keep, reordered
 
 
+def subset_matrix(labels: List[str], matrix: List[List[float]], keep_labels: List[str]) -> Tuple[List[str], List[List[float]]]:
+    index = {label: i for i, label in enumerate(labels)}
+    keep = [label for label in keep_labels if label in index]
+    subset = []
+    for row_label in keep:
+        i = index[row_label]
+        subset.append([matrix[i][index[col_label]] for col_label in keep])
+    return keep, subset
+
+
+def write_identity_matrix(matrix_tsv: Path, labels: List[str], matrix: List[List[float]]) -> None:
+    with open(matrix_tsv, "w", encoding="utf-8", newline="") as out:
+        writer = csv.writer(out, delimiter="\t")
+        writer.writerow(["sequence"] + labels)
+        for label, row in zip(labels, matrix):
+            writer.writerow([label] + [f"{value:.4f}" for value in row])
+
+
 def render_identity_heatmap(labels: List[str], matrix: List[List[float]], pdf_path: Path, png_path: Path,
                             title: str, vmin: float | None) -> None:
     import matplotlib
@@ -1221,7 +1308,7 @@ def step11_identity_plot(shared_layout: Dict[str, Path], plot_min: float | None)
 
     log_file = shared_layout["logs"] / "step11_identity_heatmap.log"
     trimmed_alignment = step10_outputs(shared_layout)[0]
-    matrix_tsv, pdf, png = step11_identity_outputs(shared_layout)
+    matrix_tsv, pdf, png, assembled_matrix_tsv, assembled_pdf, assembled_png = step11_identity_outputs(shared_layout)
     treefile = step12_tree_outputs(shared_layout)[0]
     records = load_alignment_records(trimmed_alignment)
     if not records:
@@ -1232,18 +1319,30 @@ def step11_identity_plot(shared_layout: Dict[str, Path], plot_min: float | None)
         tree_order = [term.name for term in tree.get_terminals()]
         labels, matrix = reorder_matrix(labels, matrix, tree_order)
 
-    with open(matrix_tsv, "w", encoding="utf-8", newline="") as out:
-        writer = csv.writer(out, delimiter="\t")
-        writer.writerow(["sequence"] + labels)
-        for label, row in zip(labels, matrix):
-            writer.writerow([label] + [f"{value:.4f}" for value in row])
-
+    write_identity_matrix(matrix_tsv, labels, matrix)
     render_identity_heatmap(labels, matrix, pdf, png, "CYVCV genome identity heatmap", plot_min)
+
+    assembled_labels = [label for label in labels if is_assembled_tip(label)]
+    if not assembled_labels:
+        raise RuntimeError("No assembled isolates were found for the assembled-only identity heatmap")
+    assembled_labels, assembled_matrix = subset_matrix(labels, matrix, assembled_labels)
+    write_identity_matrix(assembled_matrix_tsv, assembled_labels, assembled_matrix)
+    render_identity_heatmap(
+        assembled_labels,
+        assembled_matrix,
+        assembled_pdf,
+        assembled_png,
+        "Assembled isolate identity heatmap",
+        plot_min,
+    )
 
     with open(log_file, "a", encoding="utf-8") as logh:
         logh.write(f"[{now()}] Pairwise identity matrix written to: {matrix_tsv}\n")
         logh.write(f"[{now()}] Heatmap PDF written to: {pdf}\n")
         logh.write(f"[{now()}] Heatmap PNG written to: {png}\n")
+        logh.write(f"[{now()}] Assembled-only identity matrix written to: {assembled_matrix_tsv}\n")
+        logh.write(f"[{now()}] Assembled-only heatmap PDF written to: {assembled_pdf}\n")
+        logh.write(f"[{now()}] Assembled-only heatmap PNG written to: {assembled_png}\n")
 
 
 # ---------------------------------------------------------------------
@@ -1359,7 +1458,7 @@ def sample_summary_row(sample_layout: Dict[str, Path], shared_layout: Dict[str, 
     target_contigs = step8_outputs(sample_layout)[0]
     preselect_stats = step5_outputs(sample_layout)[1]
     trimmed_alignment, _ = step10_outputs(shared_layout)
-    identity_tsv, identity_pdf, _ = step11_identity_outputs(shared_layout)
+    identity_tsv, identity_pdf, _, assembled_identity_tsv, assembled_identity_pdf, _ = step11_identity_outputs(shared_layout)
     treefile, _, tree_pdf = step12_tree_outputs(shared_layout)
 
     reads_in = count_fastq_reads(reads)
@@ -1392,6 +1491,8 @@ def sample_summary_row(sample_layout: Dict[str, Path], shared_layout: Dict[str, 
         "trimmed_alignment": str(trimmed_alignment),
         "identity_matrix": str(identity_tsv),
         "identity_heatmap": str(identity_pdf),
+        "assembled_identity_matrix": str(assembled_identity_tsv),
+        "assembled_identity_heatmap": str(assembled_identity_pdf),
         "treefile": str(treefile),
         "tree_pdf": str(tree_pdf),
     }
@@ -1406,7 +1507,8 @@ def step11_report(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path]
         "sample", "taxid", "reads_input", "reads_after_qc", "reads_for_assembly",
         "assembly_selected_coverage", "n_complete_refs", "n_assembly_contigs",
         "n_target_contigs", "best_hit", "trimmed_alignment", "identity_matrix",
-        "identity_heatmap", "treefile", "tree_pdf"
+        "identity_heatmap", "assembled_identity_matrix", "assembled_identity_heatmap",
+        "treefile", "tree_pdf"
     ]
     with open(summary_tsv, "w", encoding="utf-8", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=fields, delimiter="\t")
@@ -1433,7 +1535,9 @@ def step11_report(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path]
     - Global alignment: {step9_outputs(shared_layout)[4]}
     - Trimmed alignment: {row['trimmed_alignment']}
     - Pairwise identity matrix: {row['identity_matrix']}
-    - Pairwise identity heatmap: {row['identity_heatmap']}
+    - Global identity heatmap: {row['identity_heatmap']}
+    - Assembled-only identity matrix: {row['assembled_identity_matrix']}
+    - Assembled-only identity heatmap: {row['assembled_identity_heatmap']}
     - Global tree: {row['treefile']}
     - Global tree PDF: {row['tree_pdf']}
     """)
@@ -1503,7 +1607,8 @@ def write_batch_summary(outdir: Path, rows: List[Dict[str, str]]) -> Tuple[Path,
         "sample", "taxid", "reads_input", "reads_after_qc", "reads_for_assembly",
         "assembly_selected_coverage", "n_complete_refs", "n_assembly_contigs",
         "n_target_contigs", "best_hit", "trimmed_alignment", "identity_matrix",
-        "identity_heatmap", "treefile", "tree_pdf"
+        "identity_heatmap", "assembled_identity_matrix", "assembled_identity_heatmap",
+        "treefile", "tree_pdf"
     ]
     with open(summary_tsv, "w", encoding="utf-8", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=fields, delimiter="\t")
@@ -1523,7 +1628,9 @@ def write_batch_summary(outdir: Path, rows: List[Dict[str, str]]) -> Tuple[Path,
             f"  Best hit: {row['best_hit']}",
             f"  Trimmed alignment: {row['trimmed_alignment']}",
             f"  Identity matrix: {row['identity_matrix']}",
-            f"  Identity heatmap: {row['identity_heatmap']}",
+            f"  Global identity heatmap: {row['identity_heatmap']}",
+            f"  Assembled-only identity matrix: {row['assembled_identity_matrix']}",
+            f"  Assembled-only identity heatmap: {row['assembled_identity_heatmap']}",
             f"  Tree: {row['treefile']}",
             f"  Tree PDF: {row['tree_pdf']}",
             "",
@@ -1584,14 +1691,16 @@ def run_single_sample_pipeline(args, shared_layout: Dict[str, Path], sample_name
              )),
         Step("Assemble with Flye",
              lambda: step6_done(layout),
-             lambda: step6_assemble(layout, shared_layout, args.threads, args.flye_mode)),
+             lambda: step6_assemble(
+                 layout, shared_layout, args.threads, args.flye_mode, iterations=args.flye_iterations
+             )),
         Step("BLAST contigs against RefSeq Virus",
              lambda: step7_done(layout),
              lambda: step7_blast(layout, shared_layout, args.threads)),
         Step("Select target contigs",
              lambda: step8_done(layout),
              lambda: step8_select_target_contigs(
-                 layout, shared_layout, args.min_pident, args.min_qcov, args.min_contig_len_phylo, sample_name
+                 layout, shared_layout, args.min_pident, args.min_qcov, sample_name
              )),
     ]
 
@@ -1616,6 +1725,32 @@ def run_single_sample_pipeline(args, shared_layout: Dict[str, Path], sample_name
             print()
             die(f"Step failed: {step.label}\nReason: {exc}")
 
+    target_count = count_fasta_records(step8_outputs(layout)[0])
+    if target_count == 0 and args.assembly_retry_all_qc:
+        print()
+        warn(
+            f"No target contigs were retained for {sample_name}. "
+            "Retrying assembly with all QC-passed reads and Flye meta mode."
+        )
+        try:
+            rescued = rescue_sample_with_all_qc_reads(
+                layout,
+                shared_layout,
+                sample_name,
+                args.min_q,
+                args.threads,
+                args.min_pident,
+                args.min_qcov,
+                args.flye_iterations,
+            )
+        except Exception as exc:
+            print()
+            die(f"Step failed: Rescue assembly with all QC reads\nReason: {exc}")
+        status = "DONE" if rescued else "DONE"
+        detail = "RECOVERED" if rescued else "NO TARGET CONTIGS"
+        draw_progress(total, total, "Rescue assembly with all QC reads", status)
+        print_status_line("Rescue result", detail, "yellow" if rescued else "red")
+
     print()
     print_status_line("Sample finished", sample_name, "green")
     print_status_line("Target contigs", summarize_path(step8_outputs(layout)[0]), "green")
@@ -1628,7 +1763,7 @@ def run_global_phylogeny(shared_layout: Dict[str, Path], sample_layouts: List[Di
         Step("Combine target contigs and build MAFFT alignment",
              lambda: step9_done(shared_layout),
              lambda: step9_collect_and_align(
-                 shared_layout, sample_layouts, args.threads, args.mafft_adjust_direction
+                 shared_layout, sample_layouts, args.threads, args.mafft_adjust_direction, args.min_contig_len_phylo
              )),
         Step("Trim alignment with trimAl",
              lambda: step10_done(shared_layout),
@@ -1684,7 +1819,7 @@ def run_pipeline(args) -> None:
 
     batch_summary_tsv, batch_summary_txt = write_batch_summary(args.outdir, batch_rows)
     trimmed_alignment, _ = step10_outputs(shared_layout)
-    identity_tsv, identity_pdf, _ = step11_identity_outputs(shared_layout)
+    identity_tsv, identity_pdf, _, assembled_identity_tsv, assembled_identity_pdf, _ = step11_identity_outputs(shared_layout)
     treefile, _, tree_pdf = step12_tree_outputs(shared_layout)
 
     print()
@@ -1693,7 +1828,9 @@ def run_pipeline(args) -> None:
     print_status_line("Global table", summarize_path(batch_summary_tsv), "green")
     print_status_line("Trimmed alignment", summarize_path(trimmed_alignment), "green")
     print_status_line("Identity matrix", summarize_path(identity_tsv), "green")
-    print_status_line("Identity heatmap", summarize_path(identity_pdf), "green")
+    print_status_line("Global identity heatmap", summarize_path(identity_pdf), "green")
+    print_status_line("Assembled-only identity matrix", summarize_path(assembled_identity_tsv), "green")
+    print_status_line("Assembled-only heatmap", summarize_path(assembled_identity_pdf), "green")
     print_status_line("Global tree", summarize_path(treefile), "green")
     print_status_line("Global tree PDF", summarize_path(tree_pdf), "green")
 
