@@ -11,7 +11,7 @@ ViraLong-ID is a command-line workflow for **viral identification from long-read
 - 🦠 Detect viral contigs from long-read data
 - 📦 Process multiple samples in one run
 - 🧬 Reuse shared references for the whole batch
-- 🔎 Build the BLAST database only once
+- 🔎 Build the BLAST database only once 
 - 🔄 Correct contig orientation automatically before final alignment
 - ✂️ Trim alignments to retain well-supported homologous regions
 - 🌳 Infer one global IQ-TREE phylogeny
@@ -80,6 +80,44 @@ Make sure these executables are available in your environment:
 - `mafft`
 - `trimal`
 - `iqtree`
+
+## Installation ⚡
+
+Clone the repository and create the Conda environment:
+
+```bash
+git clone https://github.com/Moranfel/ViraLong-ID.git
+cd ViraLong-ID
+conda env create -f ViraLong-ID_v4.2.environment.yml
+conda activate viralong-id
+```
+
+If you prefer `mamba`, you can use:
+
+```bash
+mamba env create -f ViraLong-ID_v4.2.environment.yml
+mamba activate viralong-id
+```
+
+## Quick start ▶️
+
+Run the pipeline with:
+
+```bash
+python ViraLong-ID_v4.8.py \
+  --taxid 1214459 \
+  --reads /path/to/sample1.fastq.gz /path/to/sample2.fastq.gz \
+  --sample-names Sample1 Sample2 \
+  --outdir results \
+  --refseq-virus-fasta /path/to/viral.1.1.genomic.fna \
+  --threads 16
+```
+
+To see all available options:
+
+```bash
+python ViraLong-ID_v4.8.py -h
+```
 
 ## Input 📥
 
