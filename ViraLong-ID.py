@@ -51,7 +51,7 @@ except ImportError:
 
 
 PIPELINE_NAME = "ViraLong-ID"
-PIPELINE_VERSION = "5.3-batch"
+PIPELINE_VERSION = "5.4-batch"
 
 
 # ---------------------------------------------------------------------
@@ -1713,6 +1713,7 @@ def run_single_sample_pipeline(args, shared_layout: Dict[str, Path], sample_name
     print_status_line("Tool logs", summarize_path(layout["logs"]))
     print()
 
+    rescue_performed = False
     for idx, step in enumerate(steps, start=1):
         try:
             if step.done_check():
@@ -1722,11 +1723,35 @@ def run_single_sample_pipeline(args, shared_layout: Dict[str, Path], sample_name
             step.action()
             draw_progress(idx, total, step.label, "DONE")
         except Exception as exc:
+            if step.label == "Assemble with Flye" and args.assembly_retry_all_qc:
+                print()
+                warn(
+                    f"Flye failed for {sample_name} with the preselected reads. "
+                    "Retrying with all QC-passed reads and Flye meta mode."
+                )
+                try:
+                    rescued = rescue_sample_with_all_qc_reads(
+                        layout,
+                        shared_layout,
+                        sample_name,
+                        args.min_q,
+                        args.threads,
+                        args.min_pident,
+                        args.min_qcov,
+                        args.flye_iterations,
+                    )
+                except Exception as rescue_exc:
+                    print()
+                    die(f"Step failed: Rescue assembly with all QC reads\nReason: {rescue_exc}")
+                draw_progress(total, total, "Rescue assembly with all QC reads", "DONE")
+                print_status_line("Rescue result", "RECOVERED" if rescued else "NO TARGET CONTIGS", "yellow" if rescued else "red")
+                rescue_performed = True
+                break
             print()
             die(f"Step failed: {step.label}\nReason: {exc}")
 
     target_count = count_fasta_records(step8_outputs(layout)[0])
-    if target_count == 0 and args.assembly_retry_all_qc:
+    if target_count == 0 and args.assembly_retry_all_qc and not rescue_performed:
         print()
         warn(
             f"No target contigs were retained for {sample_name}. "
