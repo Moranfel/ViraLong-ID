@@ -1,206 +1,103 @@
-# ViraLong-ID 🦠🧬
+# 🦠 ViraLong-ID v5.7
 
-![alt text](<Screenshot 2026-03-16 at 6.57.19 PM.png>)
+**ViraLong-ID** is a long-read viral identification and phylogeny pipeline for multi-sample batches. It takes ONT-style long-read data from raw reads to viral contigs, global alignments, identity heatmaps, and maximum-likelihood trees.
 
-**Long-read viral identification, identity heatmap generation, and global phylogeny pipeline**
+✨ **New in v5.7:** optional **BEAST 2 preparation and execution** for time-scaled and map-ready phylogeographic analyses.
 
-ViraLong-ID is a command-line workflow for **viral identification from long-read sequencing data** followed by **global phylogenetic reconstruction** and **pairwise genome identity visualization**. It is designed for **batch analysis of multiple samples in a single run**, while reusing shared steps such as reference download, reference preparation, and BLAST database construction.
+---
 
-## Why use ViraLong-ID? 🚀
+## 🚀 What It Does
 
-- 🦠 Detect viral contigs from long-read data
-- 📦 Process multiple samples in one run
-- 🧬 Reuse shared references for the whole batch
-- 🔎 Build the BLAST database only once 
-- 🔄 Correct contig orientation automatically before final alignment
-- ✂️ Trim alignments to retain well-supported homologous regions
-- 🌳 Infer one global IQ-TREE phylogeny
-- 🎨 Generate a pairwise identity heatmap ordered according to the final tree
-- 📄 Export the final tree as PDF with assembled isolates highlighted
-- 📁 Keep logs and outputs clearly organized
+| Step | Output |
+|---|---|
+| 🧬 Target reference download | Complete viral genomes for the selected NCBI TaxID |
+| ✨ Read QC | Filtered long reads |
+| 🧱 Assembly | Sample-level assemblies with Flye |
+| 🎯 Viral detection | BLAST-based target contig identification |
+| 🌳 Global phylogeny | MAFFT alignment, trimAl filtering, IQ-TREE tree |
+| 🎨 Identity analysis | Pairwise identity matrices and heatmaps |
+| 🕰️ BEAST 2 preparation | Dates, metadata, traits, coordinates, BEAST-safe alignment |
+| 🚀 BEAST 2 execution | Optional BEAST run plus MCC tree summarization |
 
-## What does the pipeline do? ⚙️
+---
 
-### Shared steps for the whole batch
+## 🧰 Requirements
 
-1. 📥 Download complete viral genomes for the target NCBI TaxID
-2. 🧾 Build metadata tables
-3. 🏷️ Rename complete target references
-4. 🗃️ Build a shared local BLAST database from your RefSeq virus FASTA
-
-### Per-sample steps
-
-1. ✨ Filter reads with `fastplong`
-2. ✂️ Shorten read headers for Flye
-3. 📏 Preselect reads for assembly
-4. 🧱 Assemble reads with `Flye`
-5. 🔎 BLAST contigs against the shared virus database
-6. 🎯 Retain contigs matching the selected target taxon
-
-### Global analysis steps
-
-1. 📦 Combine retained contigs from all samples
-2. 🔄 Correct sequence orientation with `MAFFT`
-3. 🧬 Build a global alignment with `MAFFT`
-4. ✂️ Trim the alignment with `trimAl`
-5. 🌳 Infer a maximum-likelihood tree with `IQ-TREE`
-6. 🎨 Build a pairwise identity matrix and heatmap from the trimmed alignment
-7. 📄 Render the final phylogeny as PDF
-8. 📝 Write per-sample and batch summary reports
-
-## What is new in the current version? ✨
-
-The latest version of ViraLong-ID includes:
-
-- robust strand correction before the final fragment alignment
-- trimmed phylogenetic alignments using `trimAl`
-- pairwise identity heatmaps generated from the trimmed alignment
-- heatmap ordering based on the final IQ-TREE topology
-- PDF tree rendering with **assembled isolates automatically highlighted**
-
-## Requirements 🛠️
-
-### Python packages
-
-- `python >= 3.9`
-- `biopython`
-- `matplotlib`
-
-### External tools
-
-Make sure these executables are available in your environment:
-
-- `datasets`
-- `dataformat`
-- `unzip`
-- `fastplong`
-- `flye`
-- `makeblastdb`
-- `blastn`
-- `mafft`
-- `trimal`
-- `iqtree`
-
-## Installation ⚡
-
-Clone the repository and create the Conda environment:
-
-```bash
-git clone https://github.com/Moranfel/ViraLong-ID.git
-cd ViraLong-ID
-conda env create -f ViraLong-ID_v4.2.environment.yml
-conda activate viralong-id
-```
-
-If you prefer `mamba`, you can use:
-
-```bash
-mamba env create -f ViraLong-ID_v4.2.environment.yml
-mamba activate viralong-id
-```
-
-## Download the RefSeq virus FASTA 📥
-
-ViraLong-ID requires a local viral FASTA file to build the shared BLAST database used for contig identification.
-
-One simple option is to download the RefSeq virus nucleotide FASTA directly from the NCBI FTP site:
-
-```bash
-curl -L -o viral.1.1.genomic.fna.gz https://ftp.ncbi.nlm.nih.gov/refseq/release/viral/viral.1.1.genomic.fna.gz
-gunzip viral.1.1.genomic.fna.gz
-```
-
-You can then pass it to the pipeline with:
-
-```bash
---refseq-virus-fasta /path/to/viral.1.1.genomic.fna
-```
-
-If needed, additional viral RefSeq partitions can also be downloaded from:
-[https://ftp.ncbi.nlm.nih.gov/refseq/release/viral/](https://ftp.ncbi.nlm.nih.gov/refseq/release/viral/)
-
-## Quick start ▶️
-
-Run the pipeline with:
-
-```bash
-python ViraLong-ID_v4.8.py \
-  --taxid 1214459 \
-  --reads /path/to/sample1.fastq.gz /path/to/sample2.fastq.gz \
-  --sample-names Sample1 Sample2 \
-  --outdir results \
-  --refseq-virus-fasta /path/to/viral.1.1.genomic.fna \
-  --threads 16
-```
-
-To see all available options:
-
-```bash
-python ViraLong-ID_v4.8.py -h
-```
-
-## Input 📥
-
-You need:
-
-- 🧬 A target NCBI Taxonomy ID
-- 📂 One or more input `FASTQ` or `FASTQ.GZ` files
-- 🗃️ A local RefSeq virus FASTA file for BLAST database creation
-- 📁 An output directory
-
-Optional arguments let you define:
-
-- 🏷️ Sample names
-- 🧵 Number of threads
-- ✨ QC thresholds
-- 🎯 BLAST filtering thresholds
-- 📏 Assembly read selection parameters
-- ✂️ trimAl stringency
-- 🔄 MAFFT strand correction mode
-- 🎨 heatmap color scale minimum
-
-## Example command 💻
-
-```bash
-python ViraLong-ID_v4.8.py \
-  --taxid 1214459 \
-  --reads /path/to/Selection.fastq.gz /path/to/Test.fastq.gz \
-  --sample-names Selection Test \
-  --outdir resultados \
-  --refseq-virus-fasta /path/to/viral.1.1.genomic.fna \
-  --threads 16 \
-  --mafft-adjust-direction on \
-  --trimal-gap-threshold 0.8 \
-  --identity-plot-min 96.5
-```
-
-## Main parameters 🧾
-
-- `--taxid`: target NCBI Taxonomy ID
-- `--reads`: one or more input `FASTQ` / `FASTQ.GZ` files
-- `--sample-names`: optional sample names in the same order as `--reads`
-- `--outdir`: output directory
-- `--refseq-virus-fasta`: local FASTA used to build the shared BLAST database
-- `--threads`: number of threads
-- `--min-q`: minimum mean read quality for `fastplong`
-- `--flye-mode`: `Flye` mode (`normal` or `meta`)
-- `--min-pident`: minimum BLAST percent identity for target contig retention
-- `--min-qcov`: minimum BLAST query coverage for target contig retention
-- `--min-contig-len-phylo`: minimum contig length retained for phylogeny
-- `--assembly-min-q`: minimum mean read quality retained for assembly
-- `--assembly-min-len`: minimum read length for assembly preselection or `auto`
-- `--assembly-max-len`: maximum read length for assembly preselection or `auto`
-- `--assembly-target-cov`: target effective coverage used to cap Flye input
-- `--trimal-gap-threshold`: trimAl gap threshold
-- `--mafft-adjust-direction`: MAFFT strand correction mode (`off`, `on`, `accurate`)
-- `--identity-plot-min`: lower bound for heatmap color scale
-
-## Output structure 📂
-
-The batch run creates **shared outputs** at the top level and **sample-specific outputs** inside `samples/`.
+### Core tools
 
 ```text
-outdir/
+datasets
+dataformat
+unzip
+fastplong
+flye
+makeblastdb
+blastn
+mafft
+trimal
+iqtree
+```
+
+### Optional BEAST 2 tools
+
+```text
+beast
+treeannotator
+```
+
+### Python dependency
+
+```text
+biopython
+```
+
+---
+
+## ⚡ Quick Start
+
+```bash
+python ViraLong-ID_v5.7.py \
+  --taxid 3433772 \
+  --reads sample1.fastq.gz sample2.fastq.gz \
+  --outdir /path/to/output \
+  --refseq-virus-fasta /path/to/refseq_virus.fasta \
+  --threads 32
+```
+
+---
+
+## 📥 Required Inputs
+
+| Argument | Description |
+|---|---|
+| `--taxid` | Target NCBI Taxonomy ID |
+| `--reads` | One or more input FASTQ/FASTQ.GZ files |
+| `--outdir` | Output directory |
+| `--refseq-virus-fasta` | Local RefSeq virus FASTA used to build the BLAST database |
+
+---
+
+## ⚙️ Useful Options
+
+| Argument | Default | Description |
+|---|---:|---|
+| `--threads` | `8` | Number of threads |
+| `--sample-names` | none | Optional sample names, same order as `--reads` |
+| `--min-q` | `15` | Minimum mean read quality for `fastplong` |
+| `--flye-mode` | `meta` | Flye mode: `normal` or `meta` |
+| `--flye-iterations` | `1` | Number of Flye polishing iterations |
+| `--min-pident` | `70.0` | Minimum BLAST identity for target contig selection |
+| `--min-qcov` | `40.0` | Minimum BLAST query coverage for target contig selection |
+| `--min-contig-len-phylo` | `300` | Minimum contig length retained for phylogeny |
+| `--trimal-gap-threshold` | `0.8` | trimAl gap threshold |
+| `--mafft-adjust-direction` | `on` | MAFFT strand correction: `off`, `on`, or `accurate` |
+
+---
+
+## 📂 Output Structure
+
+```text
+output/
 ├── 00_logs/
 ├── 01_references/
 ├── 05_blast_database/
@@ -209,76 +106,208 @@ outdir/
 ├── 07b_pairwise_identity/
 ├── 08_phylogeny_tree/
 ├── 09_report/
-└── samples/
-    ├── Sample1/
-    └── Sample2/
+├── 10_beast2_preparation/
+├── 11_beast2_run/
+├── samples/
+└── tmp/
 ```
 
-### Shared outputs 🌍
+| Folder | Contents |
+|---|---|
+| `00_logs/` | Hidden output from external tools |
+| `01_references/` | NCBI target-virus references and metadata |
+| `06_combined_target_contigs/` | Combined target contigs from all samples |
+| `07_phylogeny_alignment/` | MAFFT alignments and trimmed alignment |
+| `07b_pairwise_identity/` | Pairwise identity matrices and heatmaps |
+| `08_phylogeny_tree/` | IQ-TREE tree files and rendered tree PDF |
+| `09_report/` | Per-sample and batch summaries |
+| `10_beast2_preparation/` | Optional BEAST 2 input files and editable templates |
+| `11_beast2_run/` | Optional BEAST 2 output and MCC tree |
 
-- `01_references/` → downloaded target references and metadata
-- `05_blast_database/` → shared BLAST database files
-- `06_combined_target_contigs/` → combined retained contigs
-- `07_phylogeny_alignment/alignment_mafft.fasta` → global alignment
-- `07_phylogeny_alignment/alignment_mafft.trimmed.fasta` → trimmed alignment
-- `07b_pairwise_identity/pairwise_identity.tsv` → pairwise identity matrix
-- `07b_pairwise_identity/pairwise_identity_heatmap.pdf` → identity heatmap in PDF
-- `07b_pairwise_identity/pairwise_identity_heatmap.png` → identity heatmap in PNG
-- `08_phylogeny_tree/alignment_mafft.trimmed.treefile` → final Newick tree
-- `08_phylogeny_tree/alignment_mafft.trimmed.tree.pdf` → rendered phylogeny PDF
-- `09_report/multi_sample_summary.tsv` → batch summary table
-- `09_report/multi_sample_summary.txt` → batch summary report
+---
 
-### Per-sample outputs 🧪
+## 🕰️ BEAST 2 Workflow
 
-Each sample folder contains:
+BEAST 2 support is optional and split into clear stages.
 
-- filtered reads
-- renamed reads
-- assembly input subset
-- `Flye` assembly output
-- BLAST identification results
-- retained target contigs
-- per-sample report
+```text
+1. Prepare BEAST 2 files
+2. Fill missing dates and coordinates
+3. Rebuild BEAST 2 tables
+4. Create/review final XML in BEAUti
+5. Run BEAST 2
+6. Summarize the MCC tree
+7. Use BEAST output for map visualization
+```
 
-## Visual outputs 🎨
+This prevents long MCMC runs from starting before the temporal and geographic metadata are ready.
 
-ViraLong-ID produces two publication-friendly visual outputs:
+---
 
-### 🌳 Phylogenetic tree PDF
+## 🧪 Stage 1: Prepare BEAST 2 Files
 
-- based on the trimmed alignment
-- inferred with `IQ-TREE`
-- assembled isolates highlighted automatically
-- reference genomes shown separately in the legend
+Add:
 
-### 🟨 Pairwise identity heatmap
+```bash
+--prepare-beast2
+```
 
-- built from the trimmed alignment
-- pairwise identity values calculated between all sequences
-- ordered according to the final tree topology
-- exported as both `PDF` and `PNG`
+Example:
 
-## Terminal experience 🖥️
+```bash
+python ViraLong-ID_v5.7.py \
+  --taxid 3433772 \
+  --reads sample1.fastq.gz sample2.fastq.gz \
+  --outdir /path/to/output \
+  --refseq-virus-fasta /path/to/refseq_virus.fasta \
+  --threads 32 \
+  --prepare-beast2
+```
 
-ViraLong-ID includes a styled terminal interface with:
+This creates:
 
-- 🦠 startup logo
-- 📊 progress bars
-- 🎯 clear section blocks
-- 📁 compact summaries of outputs and logs
-- `-h` help message with styled descriptions
+```text
+10_beast2_preparation/
+```
 
-## Important notes ⚠️
+### Files created
 
-- Shared steps are run **only once per batch**
-- The final phylogeny is **global**, not per sample
-- The heatmap is generated from the **trimmed alignment**
-- The heatmap is ordered according to the **final IQ-TREE topology**
-- If no target contigs are retained across the batch, the phylogeny cannot be built
-- External tool output is hidden from the terminal and saved in log files
-- NCBI download steps may fail temporarily if the remote service is unavailable
+| File | Description |
+|---|---|
+| `alignment_beast2_safe_ids.fasta` | Trimmed alignment with BEAST-compatible sequence IDs |
+| `alignment_beast2_safe_ids.nexus` | Same alignment in NEXUS format |
+| `metadata_beast2.tsv` | Automatically extracted metadata per sequence |
+| `tip_dates_beast2.tsv` | Sampling dates formatted for BEAST/BEAUti |
+| `manual_dates_template.tsv` | Editable file for missing sampling dates |
+| `traits_beauti.tsv` | Optional discrete traits: country, host, region, sample type |
+| `map_locations_coordinates_template.tsv` | Editable location table for latitude/longitude |
+| `sequence_coordinates_template.tsv` | Per-sequence coordinate mapping table |
+| `sequence_id_map.tsv` | Original headers mapped to BEAST-safe IDs |
+| `CYVCV_BEAST2_template.xml` | Non-runnable XML template/documentation file |
+| `README_BEAST2_preparacion.md` | BEAST 2 preparation notes |
 
-## Citation 📚
+---
 
-Morán F. 2026. ViraLong-ID: long-read viral identification and global phylogeny pipeline. GitHub repository. Available at: https://github.com/Moranfel/ViraLong-ID
+## ✍️ Stage 2: Fill Manual Metadata
+
+BEAST 2 needs sampling time. Map-ready phylogeography also needs coordinates.
+
+Edit these files:
+
+```text
+manual_dates_template.tsv
+map_locations_coordinates_template.tsv
+```
+
+Use exact dates when possible:
+
+```text
+YYYY-MM-DD
+```
+
+If exact dates are unavailable, use the `year` column.
+
+---
+
+## 🔁 Stage 3: Rebuild BEAST 2 Tables
+
+After editing the TSV files, re-run with:
+
+```bash
+--prepare-beast2 \
+--beast2-manual-dates /path/to/manual_dates_template.tsv \
+--beast2-coordinates /path/to/map_locations_coordinates_template.tsv
+```
+
+This incorporates the edited dates and coordinates into the BEAST 2 tables.
+
+---
+
+## 🚀 Stage 4: Run BEAST 2
+
+Before running BEAST 2, create and review the final runnable XML in **BEAUti** using the prepared alignment, dates, traits, and coordinates.
+
+Then run:
+
+```bash
+--prepare-beast2 \
+--beast2-manual-dates /path/to/manual_dates_template.tsv \
+--beast2-coordinates /path/to/map_locations_coordinates_template.tsv \
+--run-beast2 \
+--beast2-xml /path/to/CYVCV_BEAST2.xml
+```
+
+Optional burn-in for TreeAnnotator:
+
+```bash
+--beast2-burnin 10
+```
+
+The BEAST 2 run output is written to:
+
+```text
+11_beast2_run/
+```
+
+The summarized MCC tree is:
+
+```text
+CYVCV_BEAST2.MCC.tree
+```
+
+---
+
+## 🗺️ Notes on Maps
+
+The `10_beast2_preparation/` folder does **not** generate a final map by itself.
+
+To produce a map, you need:
+
+| Requirement | Why it matters |
+|---|---|
+| ✅ Complete sampling dates | Required for time-scaled BEAST analysis |
+| ✅ Latitude/longitude coordinates | Required for continuous geographic mapping |
+| ✅ Final BEAST 2 XML | Defines the model, clock, priors, and traits |
+| ✅ Completed BEAST 2 run | Produces posterior trees/logs |
+| ✅ Visualization step | Converts BEAST output into a geographic map |
+
+Coordinates are required for continuous maps. Discrete traits such as country or region can also be used, but plotting them still requires representative coordinates.
+
+---
+
+## ♻️ Resume Behavior
+
+ViraLong-ID skips completed steps when their expected outputs already exist.
+
+When edited BEAST 2 date or coordinate files are provided, the BEAST 2 preparation step is regenerated so the updated metadata are incorporated.
+
+---
+
+## 🧬 Example: CYVCV Batch With BEAST 2 Preparation
+
+```bash
+python ViraLong-ID_v5.7.py \
+  --taxid 3433772 \
+  --reads /path/to/*.fastq.gz \
+  --threads 32 \
+  --outdir /path/to/CYVCV_output \
+  --trimal-gap-threshold 0.95 \
+  --refseq-virus-fasta /path/to/sequences.fasta \
+  --prepare-beast2
+```
+
+---
+
+## 📑 Reporting Checklist
+
+When reporting results, document:
+
+- 🧾 ViraLong-ID version
+- 🧬 Target TaxID
+- ✨ Read QC thresholds
+- 🧱 Assembly parameters
+- 🎯 BLAST identity/query coverage thresholds
+- 🌳 Alignment and trimming parameters
+- 📊 IQ-TREE model/results
+- 🕰️ BEAST 2 model, clock, tree prior, chain length, burn-in, and convergence diagnostics if BEAST 2 was used
+
