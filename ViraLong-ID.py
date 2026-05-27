@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ViraLong-ID v3.1
+ViraLong-ID v5.7
 Long-read viral identification and phylogeny pipeline.
 
 Main features
@@ -35,11 +35,13 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import json
+import re
 import shutil
 import subprocess
 import sys
 import textwrap
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Tuple
@@ -51,7 +53,7 @@ except ImportError:
 
 
 PIPELINE_NAME = "ViraLong-ID"
-PIPELINE_VERSION = "5.4-batch"
+PIPELINE_VERSION = "5.6-batch"
 
 
 # ---------------------------------------------------------------------
@@ -255,7 +257,18 @@ def print_logo() -> None:
 
 
 class LogoHelpFormatter(argparse.RawTextHelpFormatter):
-    pass
+    def __init__(self, prog):
+        super().__init__(prog, max_help_position=34, width=110)
+
+    def _get_help_string(self, action):
+        help_text = action.help or ""
+        if "%(default)" in help_text:
+            return help_text
+        if not action.option_strings or action.required:
+            return help_text
+        if action.default in (None, argparse.SUPPRESS):
+            return help_text
+        return f"{help_text} (default: %(default)s)"
 
 
 class LogoArgumentParser(argparse.ArgumentParser):
@@ -336,6 +349,8 @@ def make_shared_layout(base: Path) -> Dict[str, Path]:
         "identity": base / "07b_pairwise_identity",
         "tree": base / "08_phylogeny_tree",
         "report": base / "09_report",
+        "beast2": base / "10_beast2_preparation",
+        "beast2_run": base / "11_beast2_run",
         "samples": base / "samples",
         "tmp": base / "tmp",
     }
@@ -370,50 +385,91 @@ def make_sample_layout(shared_layout: Dict[str, Path], sample_name: str) -> Dict
 def build_parser() -> argparse.ArgumentParser:
     p = LogoArgumentParser(
         prog="ViraLong-ID.py",
+        usage=(
+            "ViraLong-ID.py --taxid TAXID --reads READS [READS ...] "
+            "--outdir OUTDIR --refseq-virus-fasta FASTA [options]"
+        ),
         formatter_class=LogoHelpFormatter,
         description=(
             "🧬 Long-read viral identification and phylogeny pipeline for one or more samples\n"
             "🦠 Shared references and BLAST database across the batch\n"
             "🌳 One combined alignment with robust strand correction, trimAl filtering, identity heatmap generation, and one global IQ-TREE phylogeny for all retained contigs"
-        )
+        ),
+        epilog=textwrap.dedent("""\
+            Typical BEAST 2 workflow:
+              1. First run with --prepare-beast2 to create editable templates.
+              2. Fill manual_dates_template.tsv and map_locations_coordinates_template.tsv.
+              3. Re-run with --beast2-manual-dates and --beast2-coordinates.
+              4. Optionally add --run-beast2 --beast2-xml after creating/reviewing the final XML in BEAUti.
+        """)
     )
-    p.add_argument("--taxid", required=True, help="🧬 Target NCBI Taxonomy ID")
-    p.add_argument("--reads", required=True, nargs="+", type=Path,
-                   help="📥 One or more input FASTQ / FASTQ.GZ files")
-    p.add_argument("--outdir", required=True, type=Path, help="📂 Output directory")
-    p.add_argument("--refseq-virus-fasta", required=True, type=Path,
-                   help="🗃️ Local RefSeq virus FASTA for BLAST database")
-    p.add_argument("--sample-names", nargs="*",
-                   help="🏷️ Optional sample names, same order as --reads")
-    p.add_argument("--threads", type=int, default=8, help="🧵 Threads")
-    p.add_argument("--min-q", type=int, default=15,
-                   help="✨ Minimum mean read quality for fastplong")
-    p.add_argument("--flye-mode", choices=["normal", "meta"], default="meta",
-                   help="🧱 Flye mode")
-    p.add_argument("--flye-iterations", type=int, default=1,
-                   help="🔁 Flye polishing iterations")
-    p.add_argument("--min-pident", type=float, default=70.0,
-                   help="🎯 Minimum BLAST identity for target contig selection")
-    p.add_argument("--min-qcov", type=float, default=40.0,
-                   help="📏 Minimum BLAST query coverage for target contig selection")
-    p.add_argument("--min-contig-len-phylo", type=int, default=300,
-                   help="🌿 Minimum contig length retained for phylogeny")
-    p.add_argument("--assembly-min-q", type=float, default=20.0,
-                   help="🔬 Minimum mean Q for reads retained for assembly")
-    p.add_argument("--assembly-min-len", default="auto",
-                   help='📐 Minimum read length for assembly preselection, or "auto"')
-    p.add_argument("--assembly-max-len", default="auto",
-                   help='📏 Maximum read length for assembly preselection, or "auto"')
-    p.add_argument("--assembly-target-cov", type=int, default=300,
-                   help="🧮 Target effective coverage used to cap input for Flye")
-    p.add_argument("--assembly-retry-all-qc", action=argparse.BooleanOptionalAction, default=True,
-                   help="🛟 Retry failed assemblies with all QC-passed reads when no target contigs are detected")
-    p.add_argument("--trimal-gap-threshold", type=float, default=0.8,
-                   help="✂️ trimAl gap threshold used to keep well-aligned columns")
-    p.add_argument("--mafft-adjust-direction", choices=["off", "on", "accurate"], default="on",
-                   help="🔄 Automatic strand correction in MAFFT")
-    p.add_argument("--identity-plot-min", type=float, default=None,
-                   help="🎨 Minimum value for pairwise identity heatmap color scale")
+
+    required = p.add_argument_group("Required inputs")
+    required.add_argument("--taxid", required=True, help="🧬 Target NCBI Taxonomy ID")
+    required.add_argument("--reads", required=True, nargs="+", type=Path,
+                          help="📥 One or more input FASTQ / FASTQ.GZ files")
+    required.add_argument("--outdir", required=True, type=Path, help="📂 Output directory")
+    required.add_argument("--refseq-virus-fasta", required=True, type=Path,
+                          help="🗃️ Local RefSeq virus FASTA for BLAST database")
+
+    run_options = p.add_argument_group("Run options")
+    run_options.add_argument("--sample-names", nargs="*",
+                             help="🏷️ Optional sample names, same order as --reads")
+    run_options.add_argument("--threads", type=int, default=8, help="🧵 Threads")
+
+    read_qc = p.add_argument_group("Read QC and assembly")
+    read_qc.add_argument("--min-q", type=int, default=15,
+                         help="✨ Minimum mean read quality for fastplong")
+    read_qc.add_argument("--flye-mode", choices=["normal", "meta"], default="meta",
+                         help="🧱 Flye mode")
+    read_qc.add_argument("--flye-iterations", type=int, default=1,
+                         help="🔁 Flye polishing iterations")
+    read_qc.add_argument("--assembly-min-q", type=float, default=20.0,
+                         help="🔬 Minimum mean Q for reads retained for assembly")
+    read_qc.add_argument("--assembly-min-len", default="auto",
+                         help='📐 Minimum read length for assembly preselection, or "auto"')
+    read_qc.add_argument("--assembly-max-len", default="auto",
+                         help='📏 Maximum read length for assembly preselection, or "auto"')
+    read_qc.add_argument("--assembly-target-cov", type=int, default=300,
+                         help="🧮 Target effective coverage used to cap input for Flye")
+    read_qc.add_argument("--assembly-retry-all-qc", action=argparse.BooleanOptionalAction, default=True,
+                         help="🛟 Retry failed assemblies with all QC-passed reads when no target contigs are detected")
+
+    target_selection = p.add_argument_group("Target contig selection")
+    target_selection.add_argument("--min-pident", type=float, default=70.0,
+                                  help="🎯 Minimum BLAST identity for target contig selection")
+    target_selection.add_argument("--min-qcov", type=float, default=40.0,
+                                  help="📏 Minimum BLAST query coverage for target contig selection")
+    target_selection.add_argument("--min-contig-len-phylo", type=int, default=300,
+                                  help="🌿 Minimum contig length retained for phylogeny")
+
+    phylogeny = p.add_argument_group("Alignment, tree, and identity plots")
+    phylogeny.add_argument("--trimal-gap-threshold", type=float, default=0.8,
+                           help="✂️ trimAl gap threshold used to keep well-aligned columns")
+    phylogeny.add_argument("--min-alignment-occupancy", type=float, default=0.7,
+                           help="🧩 Minimum fraction of sequences with a residue required to keep an alignment column")
+    phylogeny.add_argument("--min-assembled-core-occupancy", type=float, default=0.7,
+                           help="🧬 Minimum fraction of assembled contigs with a residue required to define the shared core block")
+    phylogeny.add_argument("--mafft-adjust-direction", choices=["off", "on", "accurate"], default="on",
+                           help="🔄 Automatic strand correction in MAFFT")
+    phylogeny.add_argument("--identity-plot-min", type=float, default=None,
+                           help="🎨 Minimum value for pairwise identity heatmap color scale")
+
+    beast2_prepare = p.add_argument_group("Optional BEAST 2 preparation")
+    beast2_prepare.add_argument("--prepare-beast2", action="store_true",
+                                help="🕰️ Prepare BEAST 2 input files after the global alignment")
+    beast2_prepare.add_argument("--beast2-manual-dates", type=Path, default=None,
+                                help="📝 Completed/editable TSV with manual sampling dates")
+    beast2_prepare.add_argument("--beast2-coordinates", type=Path, default=None,
+                                help="🗺️ Completed/editable TSV with latitude/longitude for map-ready outputs")
+
+    beast2_run = p.add_argument_group("Optional BEAST 2 execution")
+    beast2_run.add_argument("--run-beast2", action="store_true",
+                            help="🚀 Run BEAST 2 after validating dates, coordinates, and final XML")
+    beast2_run.add_argument("--beast2-xml", type=Path, default=None,
+                            help="🧾 Final runnable BEAST 2 XML generated/reviewed in BEAUti")
+    beast2_run.add_argument("--beast2-burnin", type=int, default=10,
+                            help="🔥 TreeAnnotator burn-in percentage")
     return p
 
 
@@ -1163,24 +1219,711 @@ def step10_done(shared_layout: Dict[str, Path]) -> bool:
     return trimmed.exists() and trimmed.stat().st_size > 0
 
 
-def step10_trimal(shared_layout: Dict[str, Path], gap_threshold: float) -> None:
+def filter_alignment_by_occupancy(in_fasta: Path, out_fasta: Path, min_occupancy: float) -> Tuple[int, int]:
+    records = list(SeqIO.parse(str(in_fasta), "fasta"))
+    if not records:
+        raise RuntimeError("trimAl produced an empty alignment")
+
+    aln_len = len(records[0].seq)
+    if aln_len == 0:
+        raise RuntimeError("trimAl produced an alignment with zero columns")
+    if any(len(rec.seq) != aln_len for rec in records):
+        raise RuntimeError("Alignment records do not all have the same length")
+
+    keep_cols = []
+    n_records = len(records)
+    for idx in range(aln_len):
+        occupied = 0
+        for rec in records:
+            base = rec.seq[idx]
+            if base not in "-?":
+                occupied += 1
+        if (occupied / n_records) >= min_occupancy:
+            keep_cols.append(idx)
+
+    if not keep_cols:
+        raise RuntimeError(
+            "Alignment occupancy filter removed all columns. Try lowering --min-alignment-occupancy."
+        )
+
+    filtered_records = []
+    for rec in records:
+        seq = "".join(rec.seq[i] for i in keep_cols)
+        rec.seq = rec.seq.__class__(seq)
+        filtered_records.append(rec)
+
+    SeqIO.write(filtered_records, str(out_fasta), "fasta")
+    return aln_len, len(keep_cols)
+
+
+def extract_assembled_core_block(in_fasta: Path, out_fasta: Path, min_occupancy: float) -> Tuple[int, int, int]:
+    records = list(SeqIO.parse(str(in_fasta), "fasta"))
+    if not records:
+        raise RuntimeError("trimAl produced an empty alignment")
+
+    assembled_records = [rec for rec in records if "__" in rec.id]
+    if not assembled_records:
+        raise RuntimeError("No assembled contigs were found to define the core alignment block")
+
+    aln_len = len(records[0].seq)
+    if aln_len == 0:
+        raise RuntimeError("trimAl produced an alignment with zero columns")
+    if any(len(rec.seq) != aln_len for rec in records):
+        raise RuntimeError("Alignment records do not all have the same length")
+
+    keep_mask = []
+    n_assembled = len(assembled_records)
+    for idx in range(aln_len):
+        occupied = 0
+        for rec in assembled_records:
+            base = rec.seq[idx]
+            if base not in "-?":
+                occupied += 1
+        keep_mask.append((occupied / n_assembled) >= min_occupancy)
+
+    best_start = None
+    best_end = None
+    run_start = None
+    for idx, keep in enumerate(keep_mask):
+        if keep and run_start is None:
+            run_start = idx
+        elif not keep and run_start is not None:
+            run_end = idx - 1
+            if best_start is None or (run_end - run_start) > (best_end - best_start):
+                best_start, best_end = run_start, run_end
+            run_start = None
+    if run_start is not None:
+        run_end = aln_len - 1
+        if best_start is None or (run_end - run_start) > (best_end - best_start):
+            best_start, best_end = run_start, run_end
+
+    if best_start is None or best_end is None:
+        raise RuntimeError(
+            "The assembled-contig core filter removed all columns. Try lowering --min-assembled-core-occupancy."
+        )
+
+    cropped_records = []
+    for rec in records:
+        seq = str(rec.seq[best_start:best_end + 1])
+        rec.seq = rec.seq.__class__(seq)
+        cropped_records.append(rec)
+
+    SeqIO.write(cropped_records, str(out_fasta), "fasta")
+    return aln_len, best_start + 1, best_end + 1
+
+
+def step10_trimal(shared_layout: Dict[str, Path], gap_threshold: float, min_occupancy: float,
+                  min_assembled_core_occupancy: float) -> None:
     log_file = shared_layout["logs"] / "step10_trimal.log"
     aln = step9_outputs(shared_layout)[4]
     trimmed, html = step10_outputs(shared_layout)
+    trimal_raw = shared_layout["aln"] / "alignment_mafft.trimal_raw.fasta"
+    core_raw = shared_layout["aln"] / "alignment_mafft.core_raw.fasta"
 
     run_logged(
         [
             "trimal",
             "-in", str(aln),
-            "-out", str(trimmed),
+            "-out", str(trimal_raw),
             "-htmlout", str(html),
             "-gt", str(gap_threshold),
         ],
         log_file
     )
 
-    if not trimmed.exists() or trimmed.stat().st_size == 0:
+    if not trimal_raw.exists() or trimal_raw.stat().st_size == 0:
         raise RuntimeError("trimAl did not produce a trimmed alignment")
+    trimal_cols, core_start, core_end = extract_assembled_core_block(
+        trimal_raw, core_raw, min_assembled_core_occupancy
+    )
+    original_cols, kept_cols = filter_alignment_by_occupancy(core_raw, trimmed, min_occupancy)
+    with open(log_file, "a", encoding="utf-8") as logh:
+        logh.write(f"[{now()}] Columns after trimAl: {trimal_cols}\n")
+        logh.write(
+            f"[{now()}] Assembled-contig core block (>= {min_assembled_core_occupancy:.2f}) "
+            f"retained columns {core_start}-{core_end}\n"
+        )
+        logh.write(f"[{now()}] Columns after occupancy filter (>= {min_occupancy:.2f}): {kept_cols}\n")
+
+
+# ---------------------------------------------------------------------
+# Optional BEAST 2 preparation
+# ---------------------------------------------------------------------
+
+def beast2_outputs(shared_layout: Dict[str, Path]) -> Dict[str, Path]:
+    outdir = shared_layout["beast2"]
+    return {
+        "outdir": outdir,
+        "alignment_fasta": outdir / "alignment_beast2_safe_ids.fasta",
+        "alignment_nexus": outdir / "alignment_beast2_safe_ids.nexus",
+        "metadata": outdir / "metadata_beast2.tsv",
+        "tip_dates": outdir / "tip_dates_beast2.tsv",
+        "manual_dates_template": outdir / "manual_dates_template.tsv",
+        "traits": outdir / "traits_beauti.tsv",
+        "locations_template": outdir / "map_locations_coordinates_template.tsv",
+        "sequence_coordinates": outdir / "sequence_coordinates_template.tsv",
+        "id_map": outdir / "sequence_id_map.tsv",
+        "xml_template": outdir / "CYVCV_BEAST2_template.xml",
+        "readme": outdir / "README_BEAST2_preparacion.md",
+    }
+
+
+def beast2_done(shared_layout: Dict[str, Path]) -> bool:
+    outputs = beast2_outputs(shared_layout)
+    required = [
+        "alignment_fasta",
+        "alignment_nexus",
+        "metadata",
+        "tip_dates",
+        "manual_dates_template",
+        "traits",
+        "locations_template",
+        "sequence_coordinates",
+        "id_map",
+        "xml_template",
+        "readme",
+    ]
+    return all(outputs[name].exists() and outputs[name].stat().st_size > 0 for name in required)
+
+
+def read_ncbi_jsonl_metadata(jsonl: Path) -> Dict[str, Dict[str, str]]:
+    metadata: Dict[str, Dict[str, str]] = {}
+    if not jsonl.exists():
+        return metadata
+    with open(jsonl, "r", encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            data = json.loads(line)
+            accession = data.get("accession", "")
+            isolate = data.get("isolate") or {}
+            host = data.get("host") or {}
+            location = data.get("location") or {}
+            metadata[accession] = {
+                "accession": accession,
+                "isolate": isolate.get("name", ""),
+                "host": host.get("organismName", ""),
+                "country_locality": location.get("geographicLocation", ""),
+                "region": location.get("geographicRegion", ""),
+                "collection_date": isolate.get("collectionDate", ""),
+                "sample_source": isolate.get("source", ""),
+                "completeness": data.get("completeness", ""),
+                "length": str(data.get("length", "")),
+                "release_date": (data.get("releaseDate", "") or "")[:10],
+                "update_date": (data.get("updateDate", "") or "")[:10],
+            }
+    return metadata
+
+
+def split_country_locality(value: str) -> Tuple[str, str]:
+    text = (value or "").replace("-_", ": ").replace("_", " ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return "", ""
+    if ":" in text:
+        country, locality = text.split(":", 1)
+        locality = locality.replace(",", "_").strip().replace(" ", "_")
+        return country.strip(), locality
+    parts = text.split()
+    two_word_countries = {"South Korea"}
+    if len(parts) >= 2 and " ".join(parts[:2]) in two_word_countries:
+        return " ".join(parts[:2]), "_".join(parts[2:])
+    return parts[0], "_".join(parts[1:])
+
+
+def decimal_sampling_date(raw: str) -> Tuple[str, str]:
+    value = (raw or "").strip()
+    if not value:
+        return "", ""
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", value)
+    if match:
+        year, month, day = map(int, match.groups())
+        sample_date = date(year, month, day)
+        start = date(year, 1, 1)
+        end = date(year + 1, 1, 1)
+        return f"{year + (sample_date - start).days / (end - start).days:.6f}", "day"
+    match = re.fullmatch(r"(\d{4})-(\d{2})", value)
+    if match:
+        year, month = map(int, match.groups())
+        sample_date = date(year, month, 15)
+        start = date(year, 1, 1)
+        end = date(year + 1, 1, 1)
+        return f"{year + (sample_date - start).days / (end - start).days:.6f}", "month_midpoint"
+    if re.fullmatch(r"\d{4}", value):
+        return value, "year_only"
+    return "", "unparsed"
+
+
+def parse_beast2_header(header: str) -> Dict[str, str]:
+    if "/" in header:
+        parts = header.split("/")
+        return {
+            "record_type": "reference",
+            "accession": parts[0],
+            "isolate": parts[1] if len(parts) > 1 else "",
+            "host": (parts[2] if len(parts) > 2 else "").replace("_", " "),
+            "country_locality": (parts[3] if len(parts) > 3 else "").replace("-_", ": ").replace("_", " "),
+        }
+
+    sample = header.split("__contig_")[0]
+    contig = f"contig_{header.split('__contig_')[1]}" if "__contig_" in header else ""
+    tokens = sample.split("_")
+    sample_id = sample
+    country = ""
+    region = ""
+    locality = ""
+    sample_type = ""
+
+    if "Spain" in tokens:
+        idx = tokens.index("Spain")
+        sample_id = "_".join(tokens[:idx])
+        country = "Spain"
+        rest = tokens[idx + 1:]
+        region = rest[0] if rest else ""
+        if rest and rest[-1] in {"Campo", "Vivero", "Germoplasma"}:
+            sample_type = rest[-1]
+            locality = "_".join(rest[1:-1])
+        else:
+            locality = "_".join(rest[1:])
+
+    if sample_id.endswith("_PCR"):
+        sample_id = sample_id[:-4]
+        if not sample_type:
+            sample_type = "PCR"
+
+    return {
+        "record_type": "local",
+        "sample": sample,
+        "sample_id": sample_id,
+        "accession": "",
+        "isolate": sample_id,
+        "host": "Citrus",
+        "country": country,
+        "region": region,
+        "locality": locality,
+        "sample_type": sample_type,
+        "contig": contig,
+    }
+
+
+def beast2_safe_sequence_id(header: str, ncbi_metadata: Dict[str, Dict[str, str]], seen: set[str]) -> str:
+    parsed = parse_beast2_header(header)
+    if parsed["record_type"] == "reference":
+        accession = parsed["accession"]
+        isolate = ncbi_metadata.get(accession, {}).get("isolate") or parsed.get("isolate") or accession
+        sequence_id = f"{accession}_{isolate}"
+    else:
+        sequence_id = parsed.get("sample_id") or parsed.get("sample") or "sequence"
+    sequence_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", sequence_id).strip("_") or "sequence"
+    base_id = sequence_id
+    suffix = 2
+    while sequence_id in seen:
+        sequence_id = f"{base_id}_{suffix}"
+        suffix += 1
+    seen.add(sequence_id)
+    return sequence_id
+
+
+def read_manual_beast2_dates(path: Path | None) -> Dict[str, str]:
+    dates: Dict[str, str] = {}
+    if path is None:
+        return dates
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            sequence_id = (row.get("sequence_id") or "").strip()
+            if not sequence_id:
+                continue
+            exact_date = (row.get("collection_date_YYYY_MM_DD") or row.get("collection_date") or "").strip()
+            year = (row.get("year") or "").strip()
+            dates[sequence_id] = exact_date or year
+    return dates
+
+
+def read_beast2_coordinates(path: Path | None) -> Dict[str, Dict[str, str]]:
+    coordinates: Dict[str, Dict[str, str]] = {}
+    if path is None:
+        return coordinates
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            location_id = (row.get("location_id") or "").strip()
+            location_label = (row.get("location_label") or "").strip()
+            payload = {
+                "latitude": (row.get("latitude") or "").strip(),
+                "longitude": (row.get("longitude") or "").strip(),
+                "coordinate_precision": (row.get("coordinate_precision") or "").strip(),
+                "coordinate_source": (row.get("coordinate_source") or "").strip(),
+            }
+            if location_id:
+                coordinates[location_id] = payload
+            if location_label:
+                coordinates[location_label] = payload
+    return coordinates
+
+
+def beast2_location_label(row: Dict[str, str]) -> str:
+    parts = [row.get("country", ""), row.get("region", ""), row.get("locality", "")]
+    parts = [part for part in parts if part and part != "NA"]
+    return " | ".join(parts) if parts else "Unknown"
+
+
+def write_tsv(path: Path, rows: List[Dict[str, object]], fieldnames: List[str]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def step13_prepare_beast2(shared_layout: Dict[str, Path], taxid: str,
+                          manual_dates_file: Path | None = None,
+                          coordinates_file: Path | None = None) -> None:
+    outputs = beast2_outputs(shared_layout)
+    mkdir(outputs["outdir"])
+    alignment = step10_outputs(shared_layout)[0]
+    _, _, jsonl = step1_outputs(shared_layout, taxid)
+    ncbi_metadata = read_ncbi_jsonl_metadata(jsonl)
+    manual_dates = read_manual_beast2_dates(manual_dates_file)
+    coordinate_overrides = read_beast2_coordinates(coordinates_file)
+
+    records = list(SeqIO.parse(str(alignment), "fasta"))
+    if not records:
+        raise RuntimeError("No sequences found in trimmed alignment for BEAST 2 preparation")
+    alignment_length = len(records[0].seq)
+    if any(len(rec.seq) != alignment_length for rec in records):
+        raise RuntimeError("Trimmed alignment is not rectangular; BEAST 2 preparation stopped")
+
+    seen: set[str] = set()
+    metadata_rows: List[Dict[str, object]] = []
+    id_map_rows: List[Dict[str, object]] = []
+    safe_records = []
+
+    for rec in records:
+        original_header = rec.id
+        sequence_id = beast2_safe_sequence_id(original_header, ncbi_metadata, seen)
+        parsed = parse_beast2_header(original_header)
+        row: Dict[str, object] = {
+            "sequence_id": sequence_id,
+            "original_header": original_header,
+            "record_type": parsed["record_type"],
+            "accession": "",
+            "isolate": "",
+            "host": "",
+            "country": "",
+            "region": "",
+            "locality": "",
+            "sample_type": "",
+            "collection_date": "",
+            "decimal_date": "",
+            "date_precision": "",
+            "date_source": "",
+            "needs_manual_date": "",
+            "sequence_length": len(rec.seq),
+            "ungapped_length": len(str(rec.seq).replace("-", "")),
+        }
+
+        if parsed["record_type"] == "reference":
+            accession = parsed["accession"]
+            ref_meta = ncbi_metadata.get(accession, {})
+            country, locality = split_country_locality(ref_meta.get("country_locality") or parsed.get("country_locality", ""))
+            collection_date = ref_meta.get("collection_date", "")
+            date_source = "NCBI collectionDate"
+            if sequence_id in manual_dates:
+                collection_date = manual_dates[sequence_id]
+                date_source = "manual_dates_file"
+            decimal_date, precision = decimal_sampling_date(collection_date)
+            row.update({
+                "accession": accession,
+                "isolate": ref_meta.get("isolate") or parsed.get("isolate", ""),
+                "host": ref_meta.get("host") or parsed.get("host", ""),
+                "country": country,
+                "region": ref_meta.get("region", ""),
+                "locality": locality,
+                "sample_type": ref_meta.get("sample_source", ""),
+                "collection_date": collection_date,
+                "decimal_date": decimal_date,
+                "date_precision": precision,
+                "date_source": date_source if decimal_date else "missing_or_unparsed",
+                "needs_manual_date": "NO" if decimal_date else "YES",
+            })
+        else:
+            collection_date = manual_dates.get(sequence_id, "")
+            decimal_date, precision = decimal_sampling_date(collection_date)
+            row.update({
+                "accession": parsed.get("sample_id", ""),
+                "isolate": parsed.get("sample_id", ""),
+                "host": parsed.get("host", ""),
+                "country": parsed.get("country", ""),
+                "region": parsed.get("region", ""),
+                "locality": parsed.get("locality", ""),
+                "sample_type": parsed.get("sample_type", ""),
+                "collection_date": collection_date,
+                "decimal_date": decimal_date,
+                "date_precision": precision,
+                "date_source": "manual_dates_file" if decimal_date else "manual_required_local_sample",
+                "needs_manual_date": "NO" if decimal_date else "YES",
+            })
+
+        rec.id = sequence_id
+        rec.name = sequence_id
+        rec.description = ""
+        safe_records.append(rec)
+        metadata_rows.append(row)
+        id_map_rows.append({"sequence_id": sequence_id, "original_header": original_header})
+
+    SeqIO.write(safe_records, str(outputs["alignment_fasta"]), "fasta")
+    with open(outputs["alignment_nexus"], "w", encoding="utf-8") as fh:
+        fh.write("#NEXUS\n\n")
+        fh.write("BEGIN DATA;\n")
+        fh.write(f"  DIMENSIONS NTAX={len(safe_records)} NCHAR={alignment_length};\n")
+        fh.write("  FORMAT DATATYPE=DNA MISSING=? GAP=-;\n")
+        fh.write("  MATRIX\n")
+        for rec in safe_records:
+            fh.write(f"  {rec.id} {str(rec.seq)}\n")
+        fh.write("  ;\nEND;\n")
+
+    metadata_fields = [
+        "sequence_id", "original_header", "record_type", "accession", "isolate", "host",
+        "country", "region", "locality", "sample_type", "collection_date", "decimal_date",
+        "date_precision", "date_source", "needs_manual_date", "sequence_length", "ungapped_length",
+    ]
+    write_tsv(outputs["metadata"], metadata_rows, metadata_fields)
+    write_tsv(
+        outputs["tip_dates"],
+        metadata_rows,
+        ["sequence_id", "collection_date", "decimal_date", "date_precision", "date_source", "needs_manual_date"],
+    )
+    write_tsv(outputs["id_map"], id_map_rows, ["sequence_id", "original_header"])
+
+    manual_rows = [
+        {
+            "sequence_id": row["sequence_id"],
+            "sample_id_or_accession": row["accession"] or row["isolate"],
+            "current_collection_date": row["collection_date"],
+            "year": "",
+            "collection_date_YYYY_MM_DD": "",
+            "notes": "",
+        }
+        for row in metadata_rows
+        if row["needs_manual_date"] == "YES"
+    ]
+    write_tsv(
+        outputs["manual_dates_template"],
+        manual_rows,
+        ["sequence_id", "sample_id_or_accession", "current_collection_date", "year", "collection_date_YYYY_MM_DD", "notes"],
+    )
+
+    traits_rows = [
+        {
+            "sequence_id": row["sequence_id"],
+            "country": row["country"] or "NA",
+            "host": (row["host"] or "NA").replace(" ", "_"),
+            "region": row["region"] or "NA",
+            "sample_type": row["sample_type"] or "NA",
+        }
+        for row in metadata_rows
+    ]
+    write_tsv(outputs["traits"], traits_rows, ["sequence_id", "country", "host", "region", "sample_type"])
+
+    locations: Dict[str, Dict[str, object]] = {}
+    for row in metadata_rows:
+        label = beast2_location_label(row)
+        if label not in locations:
+            location_id = f"loc_{len(locations) + 1:03d}"
+            coords = coordinate_overrides.get(location_id) or coordinate_overrides.get(label) or {}
+            locations[label] = {
+                "location_id": location_id,
+                "location_label": label,
+                "country": row["country"],
+                "region": row["region"],
+                "locality": row["locality"],
+                "latitude": coords.get("latitude", ""),
+                "longitude": coords.get("longitude", ""),
+                "coordinate_precision": coords.get("coordinate_precision", ""),
+                "coordinate_source": coords.get("coordinate_source", ""),
+                "notes": "Fill manually or geocode from country/region/locality before continuous phylogeography/map rendering.",
+            }
+
+    write_tsv(
+        outputs["locations_template"],
+        list(locations.values()),
+        [
+            "location_id", "location_label", "country", "region", "locality", "latitude",
+            "longitude", "coordinate_precision", "coordinate_source", "notes",
+        ],
+    )
+
+    sequence_coordinate_rows = []
+    for row in metadata_rows:
+        label = beast2_location_label(row)
+        location = locations[label]
+        sequence_coordinate_rows.append({
+            "sequence_id": row["sequence_id"],
+            "location_id": location["location_id"],
+            "location_label": label,
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "needs_coordinates": "NO" if location["latitude"] and location["longitude"] else "YES",
+        })
+    write_tsv(
+        outputs["sequence_coordinates"],
+        sequence_coordinate_rows,
+        ["sequence_id", "location_id", "location_label", "latitude", "longitude", "needs_coordinates"],
+    )
+
+    missing_dates = sum(1 for row in metadata_rows if row["needs_manual_date"] == "YES")
+    missing_locations = sum(1 for row in locations.values() if not row["latitude"] or not row["longitude"])
+    with open(outputs["xml_template"], "w", encoding="utf-8") as fh:
+        fh.write('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')
+        fh.write("<!--\n")
+        fh.write("TEMPLATE ONLY - not ready to run in BEAST 2 until required dates are complete.\n")
+        fh.write("Import alignment_beast2_safe_ids.fasta and tip_dates_beast2.tsv in BEAUti to create the final runnable XML.\n")
+        fh.write(f"Current missing sampling dates: {missing_dates}.\n")
+        fh.write(f"Current locations lacking coordinates: {missing_locations}.\n")
+        fh.write("-->\n")
+        fh.write('<beast beautitemplate="Standard" namespace="beast.base.core:beast.base.evolution.alignment:beast.base.evolution.tree" version="2.7">\n')
+        fh.write('  <data id="CYVCV_alignment" name="alignment">\n')
+        for rec in safe_records:
+            fh.write(f'    <sequence id="seq_{rec.id}" taxon="{rec.id}" totalcount="4" value="{str(rec.seq)}"/>\n')
+        fh.write("  </data>\n")
+        fh.write("</beast>\n")
+
+    readme = f"""# BEAST 2 preparation
+
+Generated from ViraLong-ID optional `--prepare-beast2` mode.
+
+## Main files
+
+- `alignment_beast2_safe_ids.fasta`: trimmed alignment with BEAST-safe sequence IDs.
+- `alignment_beast2_safe_ids.nexus`: same alignment in NEXUS format.
+- `metadata_beast2.tsv`: automatically extracted metadata.
+- `tip_dates_beast2.tsv`: sampling dates for BEAUti/BEAST.
+- `manual_dates_template.tsv`: editable file with sequences still requiring sampling dates.
+- `traits_beauti.tsv`: optional discrete traits for BEAUti.
+- `map_locations_coordinates_template.tsv`: editable file with one row per unique location.
+- `sequence_coordinates_template.tsv`: per-sequence coordinate table for map rendering.
+- `sequence_id_map.tsv`: original headers mapped to BEAST-safe IDs.
+- `CYVCV_BEAST2_template.xml`: non-runnable template until dates are complete.
+
+## Status
+
+- Sequences: {len(safe_records)}
+- Alignment length: {alignment_length}
+- Missing sampling dates: {missing_dates}
+- Unique locations: {len(locations)}
+- Locations without coordinates: {missing_locations}
+
+## Required user input
+
+1. Fill `manual_dates_template.tsv` with either `year` or `collection_date_YYYY_MM_DD`.
+2. Fill `map_locations_coordinates_template.tsv` with `latitude` and `longitude` for map-ready phylogeography.
+
+Re-run ViraLong-ID with `--prepare-beast2 --beast2-manual-dates <file> --beast2-coordinates <file>` to incorporate edited dates and coordinates.
+
+To execute BEAST 2 from ViraLong-ID, first create/review the final runnable XML in BEAUti, then run with:
+
+`--run-beast2 --beast2-xml <final.xml> --beast2-manual-dates <file> --beast2-coordinates <file>`
+"""
+    with open(outputs["readme"], "w", encoding="utf-8") as fh:
+        fh.write(readme)
+
+
+def beast2_run_outputs(shared_layout: Dict[str, Path]) -> Dict[str, Path]:
+    outdir = shared_layout["beast2_run"]
+    return {
+        "outdir": outdir,
+        "log": outdir / "beast2_run.log",
+        "mcc_tree": outdir / "CYVCV_BEAST2.MCC.tree",
+    }
+
+
+def beast2_run_done(shared_layout: Dict[str, Path]) -> bool:
+    outputs = beast2_run_outputs(shared_layout)
+    return outputs["mcc_tree"].exists() and outputs["mcc_tree"].stat().st_size > 0
+
+
+def validate_beast2_ready(shared_layout: Dict[str, Path]) -> None:
+    outputs = beast2_outputs(shared_layout)
+    missing_dates = []
+    with open(outputs["tip_dates"], "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            if (row.get("needs_manual_date") or "").strip().upper() == "YES" or not (row.get("decimal_date") or "").strip():
+                missing_dates.append(row.get("sequence_id", "unknown"))
+
+    missing_coordinates = []
+    with open(outputs["sequence_coordinates"], "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            if (row.get("needs_coordinates") or "").strip().upper() == "YES":
+                missing_coordinates.append(row.get("location_label") or row.get("sequence_id") or "unknown")
+
+    if missing_dates:
+        preview = ", ".join(missing_dates[:8])
+        raise RuntimeError(
+            f"BEAST 2 cannot run: {len(missing_dates)} sequence(s) still lack sampling dates. "
+            f"Examples: {preview}"
+        )
+    if missing_coordinates:
+        unique_preview = ", ".join(sorted(set(missing_coordinates))[:8])
+        raise RuntimeError(
+            f"BEAST 2 map-ready run cannot start: {len(set(missing_coordinates))} location(s) still lack coordinates. "
+            f"Examples: {unique_preview}"
+        )
+
+
+def resolve_beast2_xml(shared_layout: Dict[str, Path], beast2_xml: Path | None) -> Path:
+    if beast2_xml is not None:
+        return beast2_xml
+    default_xml = beast2_outputs(shared_layout)["outdir"] / "CYVCV_BEAST2.xml"
+    if default_xml.exists():
+        return default_xml
+    raise RuntimeError(
+        "BEAST 2 run requires a final runnable XML. Generate it in BEAUti from "
+        "alignment_beast2_safe_ids.fasta, tip_dates_beast2.tsv, and the coordinate/trait tables, "
+        f"then save it as {default_xml} or pass it with --beast2-xml."
+    )
+
+
+def newest_tree_file(search_dirs: List[Path]) -> Path | None:
+    candidates: List[Path] = []
+    for directory in search_dirs:
+        if directory.exists():
+            candidates.extend(directory.glob("*.trees"))
+            candidates.extend(directory.glob("*.trees.gz"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def step14_run_beast2(shared_layout: Dict[str, Path], beast2_xml: Path | None, threads: int, burnin: int) -> None:
+    validate_beast2_ready(shared_layout)
+    xml = resolve_beast2_xml(shared_layout, beast2_xml)
+    outputs = beast2_run_outputs(shared_layout)
+    mkdir(outputs["outdir"])
+
+    run_xml = outputs["outdir"] / xml.name
+    if xml.resolve() != run_xml.resolve():
+        shutil.copy2(xml, run_xml)
+
+    run_logged(
+        ["beast", "-overwrite", "-threads", str(threads), str(run_xml)],
+        outputs["log"],
+        cwd=outputs["outdir"],
+    )
+
+    tree_file = newest_tree_file([outputs["outdir"], run_xml.parent])
+    if tree_file is None:
+        raise RuntimeError("BEAST 2 finished but no .trees output was found for TreeAnnotator")
+
+    run_logged(
+        ["treeannotator", "-burnin", str(burnin), str(tree_file), str(outputs["mcc_tree"])],
+        outputs["log"],
+        cwd=outputs["outdir"],
+    )
+
+    if not outputs["mcc_tree"].exists() or outputs["mcc_tree"].stat().st_size == 0:
+        raise RuntimeError("TreeAnnotator did not produce the expected MCC tree")
 
 
 # ---------------------------------------------------------------------
@@ -1563,9 +2306,26 @@ def validate_shared_inputs(args) -> None:
         die("Biopython is not installed. Please install it in your environment before running the pipeline.")
     for exe in ["datasets", "dataformat", "unzip", "fastplong", "flye", "makeblastdb", "blastn", "mafft", "trimal", "iqtree"]:
         require_executable(exe)
+    if args.run_beast2:
+        for exe in ["beast", "treeannotator"]:
+            require_executable(exe)
 
     if not args.refseq_virus_fasta.exists():
         die(f"RefSeq virus FASTA not found: {args.refseq_virus_fasta}")
+    if args.run_beast2:
+        args.prepare_beast2 = True
+        if args.beast2_manual_dates is None:
+            die("--run-beast2 requires --beast2-manual-dates with completed sampling dates")
+        if args.beast2_coordinates is None:
+            die("--run-beast2 requires --beast2-coordinates with completed latitude/longitude")
+    if args.beast2_manual_dates is not None and not args.beast2_manual_dates.exists():
+        die(f"BEAST 2 manual dates file not found: {args.beast2_manual_dates}")
+    if args.beast2_coordinates is not None and not args.beast2_coordinates.exists():
+        die(f"BEAST 2 coordinates file not found: {args.beast2_coordinates}")
+    if args.beast2_xml is not None and not args.beast2_xml.exists():
+        die(f"BEAST 2 XML file not found: {args.beast2_xml}")
+    if not (0 <= args.beast2_burnin < 100):
+        die("--beast2-burnin must be between 0 and 99")
 
 
 def build_sample_jobs(args) -> List[SimpleNamespace]:
@@ -1792,14 +2552,47 @@ def run_global_phylogeny(shared_layout: Dict[str, Path], sample_layouts: List[Di
              )),
         Step("Trim alignment with trimAl",
              lambda: step10_done(shared_layout),
-             lambda: step10_trimal(shared_layout, args.trimal_gap_threshold)),
+             lambda: step10_trimal(
+                 shared_layout,
+                 args.trimal_gap_threshold,
+                 args.min_alignment_occupancy,
+                 args.min_assembled_core_occupancy,
+             )),
+    ]
+    if args.prepare_beast2:
+        steps.append(
+            Step("Prepare optional BEAST 2 input files",
+                 lambda: (
+                     beast2_done(shared_layout)
+                     and args.beast2_manual_dates is None
+                     and args.beast2_coordinates is None
+                 ),
+                 lambda: step13_prepare_beast2(
+                     shared_layout,
+                     args.taxid,
+                     args.beast2_manual_dates,
+                     args.beast2_coordinates,
+                 ))
+        )
+    if args.run_beast2:
+        steps.append(
+            Step("Run BEAST 2 and summarize MCC tree",
+                 lambda: beast2_run_done(shared_layout),
+                 lambda: step14_run_beast2(
+                     shared_layout,
+                     args.beast2_xml,
+                     args.threads,
+                     args.beast2_burnin,
+                 ))
+        )
+    steps.extend([
         Step("Infer batch ML tree and render PDF",
              lambda: step12_tree_done(shared_layout),
              lambda: step12_iqtree(shared_layout, args.threads)),
         Step("Build pairwise identity heatmap",
              lambda: step11_identity_done(shared_layout),
              lambda: step11_identity_plot(shared_layout, args.identity_plot_min)),
-    ]
+    ])
 
     print_section("Global phylogeny")
     for idx, step in enumerate(steps, start=1):
@@ -1858,6 +2651,15 @@ def run_pipeline(args) -> None:
     print_status_line("Assembled-only heatmap", summarize_path(assembled_identity_pdf), "green")
     print_status_line("Global tree", summarize_path(treefile), "green")
     print_status_line("Global tree PDF", summarize_path(tree_pdf), "green")
+    if args.prepare_beast2:
+        beast2 = beast2_outputs(shared_layout)
+        print_status_line("BEAST 2 folder", summarize_path(beast2["outdir"]), "green")
+        print_status_line("BEAST 2 manual dates", summarize_path(beast2["manual_dates_template"]), "yellow")
+        print_status_line("BEAST 2 map coordinates", summarize_path(beast2["locations_template"]), "yellow")
+    if args.run_beast2:
+        beast2_run = beast2_run_outputs(shared_layout)
+        print_status_line("BEAST 2 run folder", summarize_path(beast2_run["outdir"]), "green")
+        print_status_line("BEAST 2 MCC tree", summarize_path(beast2_run["mcc_tree"]), "green")
 
 
 def main() -> None:
