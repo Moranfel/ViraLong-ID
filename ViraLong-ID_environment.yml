@@ -14,5 +14,6 @@ dependencies:
   - mafft
   - trimal
   - iqtree
+  - beast2
   - unzip
   - pip
