@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import os
 import json
 import re
 import shutil
@@ -123,6 +124,16 @@ def sanitize_field(text: str | None) -> str:
     return text.strip("_-") or "NA"
 
 
+def external_tool_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    path_parts = [part for part in env.get("PATH", "").split(":") if part]
+    for required_path in ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]:
+        if required_path not in path_parts:
+            path_parts.append(required_path)
+    env["PATH"] = ":".join(path_parts)
+    return env
+
+
 def run_logged(cmd: List[str], log_file: Path, cwd: Path | None = None) -> None:
     mkdir(log_file.parent)
     with open(log_file, "a", encoding="utf-8") as logh:
@@ -135,6 +146,7 @@ def run_logged(cmd: List[str], log_file: Path, cwd: Path | None = None) -> None:
             stderr=logh,
             text=True,
             check=False,
+            env=external_tool_env(),
         )
         if proc.returncode != 0:
             raise RuntimeError(f"Command failed: {' '.join(cmd)}")
@@ -467,9 +479,13 @@ def build_parser() -> argparse.ArgumentParser:
     beast2_run.add_argument("--run-beast2", action="store_true",
                             help="🚀 Run BEAST 2 after validating dates, coordinates, and final XML")
     beast2_run.add_argument("--beast2-xml", type=Path, default=None,
-                            help="🧾 Final runnable BEAST 2 XML generated/reviewed in BEAUti")
+                            help="🧾 Optional custom BEAST 2 XML; if omitted, ViraLong writes a basic XML automatically")
     beast2_run.add_argument("--beast2-burnin", type=int, default=10,
                             help="🔥 TreeAnnotator burn-in percentage")
+    beast2_run.add_argument("--beast2-chain-length", type=int, default=10_000_000,
+                            help="⛓️ MCMC chain length for the automatically generated BEAST 2 XML")
+    beast2_run.add_argument("--beast2-log-every", type=int, default=10_000,
+                            help="🧾 Logging interval for the automatically generated BEAST 2 XML")
     return p
 
 
@@ -533,7 +549,7 @@ def build_metadata_table(jsonl: Path, meta_tsv: Path, complete_meta: Path, log_f
     ]
     with open(meta_tsv, "w", encoding="utf-8") as out, open(log_file, "a", encoding="utf-8") as logh:
         logh.write(f"\n[{now()}] CMD: {' '.join(cmd)}\n")
-        proc = subprocess.run(cmd, stdout=out, stderr=logh, text=True, check=False)
+        proc = subprocess.run(cmd, stdout=out, stderr=logh, text=True, check=False, env=external_tool_env())
         if proc.returncode != 0:
             raise RuntimeError("dataformat failed")
 
@@ -1137,7 +1153,7 @@ def step9_collect_and_align(shared_layout: Dict[str, Path], sample_layouts: List
     ]
     with open(ref_aln, "w", encoding="utf-8") as out, open(log_file, "a", encoding="utf-8") as logh:
         logh.write(f"\n[{now()}] CMD: {' '.join(cmd1)}\n")
-        proc = subprocess.run(cmd1, stdout=out, stderr=logh, text=True, check=False)
+        proc = subprocess.run(cmd1, stdout=out, stderr=logh, text=True, check=False, env=external_tool_env())
         if proc.returncode != 0:
             raise RuntimeError("MAFFT reference alignment failed")
 
@@ -1166,7 +1182,7 @@ def step9_collect_and_align(shared_layout: Dict[str, Path], sample_layouts: List
         oriented_full = shared_layout["aln"] / "direction_guide_plus_contigs.aligned.fasta"
         with open(oriented_full, "w", encoding="utf-8") as out, open(log_file, "a", encoding="utf-8") as logh:
             logh.write(f"\n[{now()}] CMD: {' '.join(cmd_orient)}\n")
-            proc = subprocess.run(cmd_orient, stdout=out, stderr=logh, text=True, check=False)
+            proc = subprocess.run(cmd_orient, stdout=out, stderr=logh, text=True, check=False, env=external_tool_env())
             if proc.returncode != 0:
                 raise RuntimeError("MAFFT strand correction failed")
 
@@ -1196,7 +1212,7 @@ def step9_collect_and_align(shared_layout: Dict[str, Path], sample_layouts: List
     ]
     with open(aln, "w", encoding="utf-8") as out, open(log_file, "a", encoding="utf-8") as logh:
         logh.write(f"\n[{now()}] CMD: {' '.join(cmd2)}\n")
-        proc = subprocess.run(cmd2, stdout=out, stderr=logh, text=True, check=False)
+        proc = subprocess.run(cmd2, stdout=out, stderr=logh, text=True, check=False, env=external_tool_env())
         if proc.returncode != 0:
             raise RuntimeError("MAFFT addfragments step failed")
 
@@ -1707,8 +1723,16 @@ def step13_prepare_beast2(shared_layout: Dict[str, Path], taxid: str,
         for row in metadata_rows
         if row["needs_manual_date"] == "YES"
     ]
+    manual_template_out = outputs["manual_dates_template"]
+    if manual_dates_file is not None:
+        try:
+            same_manual_path = manual_dates_file.resolve() == manual_template_out.resolve()
+        except OSError:
+            same_manual_path = False
+        if same_manual_path:
+            manual_template_out = outputs["outdir"] / "manual_dates_missing_after_import.tsv"
     write_tsv(
-        outputs["manual_dates_template"],
+        manual_template_out,
         manual_rows,
         ["sequence_id", "sample_id_or_accession", "current_collection_date", "year", "collection_date_YYYY_MM_DD", "notes"],
     )
@@ -1744,8 +1768,16 @@ def step13_prepare_beast2(shared_layout: Dict[str, Path], taxid: str,
                 "notes": "Fill manually or geocode from country/region/locality before continuous phylogeography/map rendering.",
             }
 
+    locations_template_out = outputs["locations_template"]
+    if coordinates_file is not None:
+        try:
+            same_coordinates_path = coordinates_file.resolve() == locations_template_out.resolve()
+        except OSError:
+            same_coordinates_path = False
+        if same_coordinates_path:
+            locations_template_out = outputs["outdir"] / "map_locations_missing_after_import.tsv"
     write_tsv(
-        outputs["locations_template"],
+        locations_template_out,
         list(locations.values()),
         [
             "location_id", "location_label", "country", "region", "locality", "latitude",
@@ -1820,9 +1852,12 @@ Generated from ViraLong-ID optional `--prepare-beast2` mode.
 
 Re-run ViraLong-ID with `--prepare-beast2 --beast2-manual-dates <file> --beast2-coordinates <file>` to incorporate edited dates and coordinates.
 
-To execute BEAST 2 from ViraLong-ID, first create/review the final runnable XML in BEAUti, then run with:
+To execute BEAST 2 from ViraLong-ID, complete the editable date and coordinate tables, then run with:
 
-`--run-beast2 --beast2-xml <final.xml> --beast2-manual-dates <file> --beast2-coordinates <file>`
+`--run-beast2 --beast2-manual-dates <file> --beast2-coordinates <file>`
+
+If `--beast2-xml` is omitted, ViraLong-ID writes a basic automatic XML at `CYVCV_BEAST2.xml`.
+Use `--beast2-xml <final.xml>` only when you want to run a custom XML generated/reviewed elsewhere.
 """
     with open(outputs["readme"], "w", encoding="utf-8") as fh:
         fh.write(readme)
@@ -1834,12 +1869,20 @@ def beast2_run_outputs(shared_layout: Dict[str, Path]) -> Dict[str, Path]:
         "outdir": outdir,
         "log": outdir / "beast2_run.log",
         "mcc_tree": outdir / "CYVCV_BEAST2.MCC.tree",
+        "map_pdf": outdir / "CYVCV_BEAST2_phylogeography_map.pdf",
+        "map_png": outdir / "CYVCV_BEAST2_phylogeography_map.png",
+        "map_html": outdir / "CYVCV_BEAST2_phylogeography_map.html",
+        "time_tree_pdf": outdir / "CYVCV_BEAST2_time_tree.pdf",
+        "time_tree_png": outdir / "CYVCV_BEAST2_time_tree.png",
+        "map_edges_tsv": outdir / "CYVCV_BEAST2_phylogeography_edges.tsv",
+        "visuals_version": outdir / "CYVCV_BEAST2_visuals_v6.done",
     }
 
 
 def beast2_run_done(shared_layout: Dict[str, Path]) -> bool:
     outputs = beast2_run_outputs(shared_layout)
-    return outputs["mcc_tree"].exists() and outputs["mcc_tree"].stat().st_size > 0
+    required = ["mcc_tree", "map_pdf", "map_png", "map_html", "time_tree_pdf", "time_tree_png", "map_edges_tsv", "visuals_version"]
+    return all(outputs[name].exists() and outputs[name].stat().st_size > 0 for name in required)
 
 
 def validate_beast2_ready(shared_layout: Dict[str, Path]) -> None:
@@ -1872,17 +1915,168 @@ def validate_beast2_ready(shared_layout: Dict[str, Path]) -> None:
         )
 
 
-def resolve_beast2_xml(shared_layout: Dict[str, Path], beast2_xml: Path | None) -> Path:
+def xml_escape(value: str) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def write_auto_beast2_xml(shared_layout: Dict[str, Path], xml_path: Path,
+                          chain_length: int, log_every: int) -> None:
+    outputs = beast2_outputs(shared_layout)
+    records = list(SeqIO.parse(str(outputs["alignment_fasta"]), "fasta"))
+    if not records:
+        raise RuntimeError("Cannot write automatic BEAST 2 XML: no alignment records found")
+
+    tip_dates: Dict[str, str] = {}
+    with open(outputs["tip_dates"], "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            sequence_id = (row.get("sequence_id") or "").strip()
+            decimal_date = (row.get("decimal_date") or "").strip()
+            if sequence_id and decimal_date:
+                tip_dates[sequence_id] = decimal_date
+
+    missing = [rec.id for rec in records if rec.id not in tip_dates]
+    if missing:
+        preview = ", ".join(missing[:8])
+        raise RuntimeError(f"Cannot write automatic BEAST 2 XML: missing dates for {preview}")
+
+    trait_value = ",\n                ".join(
+        f"{xml_escape(rec.id)} = {tip_dates[rec.id]}" for rec in records
+    )
+
+    with open(xml_path, "w", encoding="utf-8") as fh:
+        fh.write("""<?xml version="1.0" encoding="UTF-8"?>
+<beast version='2.0'
+       namespace='beast.base.math:beast.base.evolution.alignment:beast.pkgmgmt:beast.base.core:beast.base.inference:beast.base.inference.distribution:beast.base.evolution.tree.coalescent:beast.base.inference.util:beast.evolution.nuc:beast.base.evolution.operator:beast.base.inference.operator:beast.base.evolution.sitemodel:beast.base.evolution.substitutionmodel:beast.base.evolution.likelihood'>
+
+    <!-- Automatic ViraLong-ID BEAST 2 XML.
+         Basic first-pass configuration: HKY, strict clock, constant coalescent population.
+         Coordinates are validated/exported for map post-processing but are not modelled in this basic XML. -->
+
+    <data id="alignment" dataType="nucleotide">
+""")
+        for rec in records:
+            fh.write(f'        <sequence taxon="{xml_escape(rec.id)}">\n')
+            fh.write(f"            {str(rec.seq)}\n")
+            fh.write("        </sequence>\n")
+        fh.write(f"""    </data>
+
+    <input spec='HKY' id='hky'>
+        <parameter name='kappa' idref='hky.kappa'/>
+        <input id='freqs' name='frequencies' spec='Frequencies'>
+            <input name='data' idref='alignment'/>
+        </input>
+    </input>
+
+    <input spec='SiteModel' id="siteModel">
+        <input name='substModel' idref='hky'/>
+    </input>
+
+    <parameter id="hky.kappa" value="2.0" lower="0.0"/>
+    <input spec='beast.base.inference.parameter.RealParameter' id="popSize">1.0</input>
+
+    <tree spec='beast.base.evolution.tree.ClusterTree' id='tree' clusterType='upgma'>
+        <trait spec='beast.base.evolution.tree.TraitSet' traitname='date-forward' units='year'
+               value='
+                {trait_value}
+               '>
+            <taxa spec='TaxonSet' alignment='@alignment'/>
+        </trait>
+        <input name='taxa' idref='alignment'/>
+    </tree>
+
+    <input spec='TreeLikelihood' id="treeLikelihood">
+        <input name='data' idref="alignment"/>
+        <input name='tree' idref="tree"/>
+        <input name='siteModel' idref="siteModel"/>
+        <branchRateModel id="StrictClockModel" spec="beast.base.evolution.branchratemodel.StrictClockModel">
+            <parameter dimension="1" estimate="false" id="clockRate" name="clock.rate" value="1.0E-4"/>
+        </branchRateModel>
+    </input>
+
+    <run spec="MCMC" id="mcmc" chainLength="{chain_length}">
+        <state>
+            <input name='stateNode' idref="hky.kappa"/>
+            <input name='stateNode' idref="popSize"/>
+            <input name='stateNode' idref="tree"/>
+        </state>
+
+        <distribution spec="CompoundDistribution" id="posterior">
+            <distribution id="coalescent" spec="Coalescent">
+                <treeIntervals spec='beast.base.evolution.tree.TreeIntervals' id='TreeIntervals'>
+                     <tree idref="tree"/>
+                </treeIntervals>
+                <populationModel spec="ConstantPopulation" id='ConstantPopulation'>
+                    <parameter name="popSize" idref="popSize"/>
+                </populationModel>
+            </distribution>
+            <distribution id='likelihood' idref="treeLikelihood"/>
+        </distribution>
+
+        <operator id='kappaScaler' spec='ScaleOperator' scaleFactor="0.5" weight="1">
+            <parameter idref="hky.kappa"/>
+        </operator>
+        <operator id='popSizeScaler' spec='ScaleOperator' scaleFactor="0.5" weight="1">
+            <parameter idref="popSize"/>
+        </operator>
+        <operator id='treeScaler' spec='ScaleOperator' scaleFactor="0.5" weight="1">
+            <tree idref="tree"/>
+        </operator>
+        <operator spec='beast.base.evolution.operator.Uniform' weight="10">
+            <tree idref="tree"/>
+        </operator>
+        <operator spec='SubtreeSlide' weight="5" gaussian="true" size="1.0">
+            <tree idref="tree"/>
+        </operator>
+        <operator id='narrow' spec='Exchange' isNarrow='true' weight="1">
+            <tree idref="tree"/>
+        </operator>
+        <operator id='wide' spec='Exchange' isNarrow='false' weight="1">
+            <tree idref="tree"/>
+        </operator>
+        <operator spec='WilsonBalding' weight="1">
+            <tree idref="tree"/>
+        </operator>
+
+        <logger logEvery="{log_every}" fileName="CYVCV_BEAST2.log">
+            <model idref='posterior'/>
+            <log idref="coalescent"/>
+            <log idref="likelihood"/>
+            <log idref="popSize"/>
+            <log idref="hky.kappa"/>
+            <log idref="posterior"/>
+            <log spec='beast.base.evolution.tree.TreeHeightLogger' tree='@tree'/>
+        </logger>
+        <logger logEvery="{log_every}" fileName="CYVCV_BEAST2.trees">
+            <log idref="tree"/>
+        </logger>
+        <logger logEvery="{log_every}">
+            <model idref='posterior'/>
+            <log idref="coalescent"/>
+            <log idref="likelihood"/>
+            <log idref="popSize"/>
+            <log idref="hky.kappa"/>
+            <log idref="posterior"/>
+        </logger>
+    </run>
+
+</beast>
+""")
+
+
+def resolve_beast2_xml(shared_layout: Dict[str, Path], beast2_xml: Path | None,
+                       chain_length: int, log_every: int) -> Path:
     if beast2_xml is not None:
         return beast2_xml
     default_xml = beast2_outputs(shared_layout)["outdir"] / "CYVCV_BEAST2.xml"
-    if default_xml.exists():
-        return default_xml
-    raise RuntimeError(
-        "BEAST 2 run requires a final runnable XML. Generate it in BEAUti from "
-        "alignment_beast2_safe_ids.fasta, tip_dates_beast2.tsv, and the coordinate/trait tables, "
-        f"then save it as {default_xml} or pass it with --beast2-xml."
-    )
+    write_auto_beast2_xml(shared_layout, default_xml, chain_length, log_every)
+    return default_xml
 
 
 def newest_tree_file(search_dirs: List[Path]) -> Path | None:
@@ -1896,9 +2090,10 @@ def newest_tree_file(search_dirs: List[Path]) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def step14_run_beast2(shared_layout: Dict[str, Path], beast2_xml: Path | None, threads: int, burnin: int) -> None:
+def step14_run_beast2(shared_layout: Dict[str, Path], beast2_xml: Path | None, threads: int,
+                       burnin: int, chain_length: int, log_every: int) -> None:
     validate_beast2_ready(shared_layout)
-    xml = resolve_beast2_xml(shared_layout, beast2_xml)
+    xml = resolve_beast2_xml(shared_layout, beast2_xml, chain_length, log_every)
     outputs = beast2_run_outputs(shared_layout)
     mkdir(outputs["outdir"])
 
@@ -1906,24 +2101,1073 @@ def step14_run_beast2(shared_layout: Dict[str, Path], beast2_xml: Path | None, t
     if xml.resolve() != run_xml.resolve():
         shutil.copy2(xml, run_xml)
 
-    run_logged(
-        ["beast", "-overwrite", "-threads", str(threads), str(run_xml)],
-        outputs["log"],
-        cwd=outputs["outdir"],
-    )
+    if not outputs["mcc_tree"].exists() or outputs["mcc_tree"].stat().st_size == 0:
+        run_logged(
+            ["beast", "-overwrite", "-threads", str(threads), str(run_xml)],
+            outputs["log"],
+            cwd=outputs["outdir"],
+        )
 
-    tree_file = newest_tree_file([outputs["outdir"], run_xml.parent])
-    if tree_file is None:
-        raise RuntimeError("BEAST 2 finished but no .trees output was found for TreeAnnotator")
+        tree_file = newest_tree_file([outputs["outdir"], run_xml.parent])
+        if tree_file is None:
+            raise RuntimeError("BEAST 2 finished but no .trees output was found for TreeAnnotator")
 
-    run_logged(
-        ["treeannotator", "-burnin", str(burnin), str(tree_file), str(outputs["mcc_tree"])],
-        outputs["log"],
-        cwd=outputs["outdir"],
-    )
+        run_logged(
+            ["treeannotator", "-burnin", str(burnin), str(tree_file), str(outputs["mcc_tree"])],
+            outputs["log"],
+            cwd=outputs["outdir"],
+        )
+    else:
+        with open(outputs["log"], "a", encoding="utf-8") as logh:
+            logh.write(f"[{now()}] Existing MCC tree found; skipping BEAST 2 and TreeAnnotator rerun.\n")
 
     if not outputs["mcc_tree"].exists() or outputs["mcc_tree"].stat().st_size == 0:
         raise RuntimeError("TreeAnnotator did not produce the expected MCC tree")
+
+    render_beast2_visual_outputs(shared_layout)
+
+
+
+def beast2_parse_float(value: str | None) -> float | None:
+    text = (value or "").strip().replace(",", ".")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def read_beast2_tip_dates_table(path: Path) -> Dict[str, float]:
+    dates: Dict[str, float] = {}
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            sequence_id = (row.get("sequence_id") or "").strip()
+            decimal_date = beast2_parse_float(row.get("decimal_date"))
+            if sequence_id and decimal_date is not None:
+                dates[sequence_id] = decimal_date
+    return dates
+
+
+def read_beast2_metadata_table(path: Path) -> Dict[str, Dict[str, str]]:
+    rows: Dict[str, Dict[str, str]] = {}
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            sequence_id = (row.get("sequence_id") or "").strip()
+            if sequence_id:
+                rows[sequence_id] = row
+    return rows
+
+
+def read_beast2_sequence_coordinates(path: Path) -> Dict[str, Dict[str, object]]:
+    coordinates: Dict[str, Dict[str, object]] = {}
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            sequence_id = (row.get("sequence_id") or "").strip()
+            lat = beast2_parse_float(row.get("latitude"))
+            lon = beast2_parse_float(row.get("longitude"))
+            if not sequence_id or lat is None or lon is None:
+                continue
+            coordinates[sequence_id] = {
+                "lat": lat,
+                "lon": lon,
+                "location_id": (row.get("location_id") or "").strip(),
+                "location_label": (row.get("location_label") or "").strip() or sequence_id,
+            }
+    return coordinates
+
+
+def parse_beast2_mcc_taxlabels(path: Path) -> Dict[str, str]:
+    labels: List[str] = []
+    in_taxlabels = False
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            lower = line.lower()
+            if lower.startswith("taxlabels"):
+                in_taxlabels = True
+                line = line[len("taxlabels"):].strip()
+                if not line:
+                    continue
+            if not in_taxlabels:
+                continue
+            finished = line.endswith(";")
+            if finished:
+                line = line[:-1].strip()
+            if line:
+                labels.extend(part.strip("'\"") for part in line.split() if part.strip())
+            if finished:
+                break
+    return {str(index + 1): label for index, label in enumerate(labels)}
+
+
+def extract_beast2_mcc_newick(path: Path) -> str:
+    collecting = False
+    chunks: List[str] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not collecting and line.lower().startswith("tree "):
+                collecting = True
+                line = line.split("=", 1)[1].strip()
+            if collecting:
+                chunks.append(line)
+                if line.endswith(";"):
+                    break
+    if not chunks:
+        raise RuntimeError(f"No MCC tree line found in {path}")
+    return " ".join(chunks)
+
+
+def replace_beast2_numeric_tip_labels(newick: str, taxlabels: Dict[str, str]) -> str:
+    out: List[str] = []
+    i = 0
+    n = len(newick)
+    while i < n:
+        ch = newick[i]
+        out.append(ch)
+        i += 1
+        if ch not in "(,":
+            continue
+        while i < n and newick[i].isspace():
+            out.append(newick[i])
+            i += 1
+        j = i
+        while j < n and newick[j].isdigit():
+            j += 1
+        token = newick[i:j]
+        if token in taxlabels and (j == n or newick[j] in "[:),"):
+            out.append(taxlabels[token])
+            i = j
+    return "".join(out)
+
+
+def read_beast2_mcc_tree(path: Path):
+    from io import StringIO
+    from Bio import Phylo
+
+    taxlabels = parse_beast2_mcc_taxlabels(path)
+    newick = extract_beast2_mcc_newick(path)
+    if taxlabels:
+        newick = replace_beast2_numeric_tip_labels(newick, taxlabels)
+    return Phylo.read(StringIO(newick), "newick")
+
+
+def parse_beast2_comment_number(comment: str | None, key: str) -> float | None:
+    if not comment:
+        return None
+    match = re.search(r"(?:^|[,&])" + re.escape(key) + r"=([-+0-9.Ee]+)", comment)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def is_local_beast2_tip(sequence_id: str, metadata: Dict[str, Dict[str, str]]) -> bool:
+    row = metadata.get(sequence_id, {})
+    if (row.get("record_type") or "").strip().lower() == "local":
+        return True
+    return sequence_id.startswith(("IVIA_", "LNR_"))
+
+
+def annotate_beast2_tree_for_visuals(tree, tip_dates: Dict[str, float],
+                                     tip_coordinates: Dict[str, Dict[str, object]]) -> float:
+    if not tip_dates:
+        raise RuntimeError("Cannot render BEAST 2 visuals: no tip dates found")
+    newest_date = max(tip_dates.values())
+    node_counter = 0
+
+    for clade in tree.find_clades(order="preorder"):
+        if clade.is_terminal():
+            clade._beast_node_id = clade.name or "tip"
+        else:
+            node_counter += 1
+            clade._beast_node_id = f"node_{node_counter:04d}"
+
+    def visit(clade):
+        comment = getattr(clade, "comment", None)
+        parsed_height = parse_beast2_comment_number(comment, "height")
+        if clade.is_terminal():
+            tip_date = tip_dates.get(clade.name or "")
+            fallback_height = newest_date - tip_date if tip_date is not None else 0.0
+            height = parsed_height if parsed_height is not None else fallback_height
+            coord_row = tip_coordinates.get(clade.name or "")
+            coord = None
+            if coord_row:
+                coord = (float(coord_row["lon"]), float(coord_row["lat"]))
+            clade._beast_tip_count = 1
+            clade._beast_coord = coord
+            clade._beast_height = height
+            clade._beast_date = newest_date - height
+            clade._beast_posterior = parse_beast2_comment_number(comment, "posterior")
+            return coord, height, 1
+
+        child_results = [visit(child) for child in clade.clades]
+        weighted_lon = 0.0
+        weighted_lat = 0.0
+        weight = 0
+        tip_count = 0
+        for coord, _height, child_tips in child_results:
+            tip_count += child_tips
+            if coord is None:
+                continue
+            weighted_lon += coord[0] * child_tips
+            weighted_lat += coord[1] * child_tips
+            weight += child_tips
+        coord = (weighted_lon / weight, weighted_lat / weight) if weight else None
+        if parsed_height is not None:
+            height = parsed_height
+        else:
+            child_heights = [h + (child.branch_length or 0.0) for child, (_c, h, _n) in zip(clade.clades, child_results)]
+            height = max(child_heights) if child_heights else 0.0
+        clade._beast_tip_count = max(1, tip_count)
+        clade._beast_coord = coord
+        clade._beast_height = height
+        clade._beast_date = newest_date - height
+        clade._beast_posterior = parse_beast2_comment_number(comment, "posterior")
+        return coord, height, clade._beast_tip_count
+
+    visit(tree.root)
+    return newest_date
+
+
+def write_beast2_phylogeography_edges(tree, path: Path) -> None:
+    rows: List[Dict[str, object]] = []
+    for parent in tree.find_clades(order="preorder"):
+        parent_coord = getattr(parent, "_beast_coord", None)
+        if parent_coord is None:
+            continue
+        for child in parent.clades:
+            child_coord = getattr(child, "_beast_coord", None)
+            if child_coord is None:
+                continue
+            rows.append({
+                "parent_node": getattr(parent, "_beast_node_id", ""),
+                "child_node": getattr(child, "_beast_node_id", ""),
+                "child_is_tip": "YES" if child.is_terminal() else "NO",
+                "parent_decimal_date": f"{getattr(parent, '_beast_date', 0.0):.6f}",
+                "child_decimal_date": f"{getattr(child, '_beast_date', 0.0):.6f}",
+                "parent_longitude": f"{parent_coord[0]:.6f}",
+                "parent_latitude": f"{parent_coord[1]:.6f}",
+                "child_longitude": f"{child_coord[0]:.6f}",
+                "child_latitude": f"{child_coord[1]:.6f}",
+                "child_descendant_tips": getattr(child, "_beast_tip_count", 1),
+                "child_posterior": "" if getattr(child, "_beast_posterior", None) is None else f"{child._beast_posterior:.6f}",
+            })
+    write_tsv(
+        path,
+        rows,
+        [
+            "parent_node", "child_node", "child_is_tip", "parent_decimal_date", "child_decimal_date",
+            "parent_longitude", "parent_latitude", "child_longitude", "child_latitude",
+            "child_descendant_tips", "child_posterior",
+        ],
+    )
+
+
+def draw_simple_world_context(ax) -> None:
+    from matplotlib.patches import Polygon
+
+    ax.set_facecolor("#eef6fb")
+    land_polygons = [
+        [(-168, 14), (-150, 58), (-108, 72), (-55, 52), (-50, 25), (-82, 8), (-118, 16)],
+        [(-82, 12), (-74, -18), (-65, -55), (-38, -52), (-34, -10), (-52, 8)],
+        [(-12, 36), (8, 58), (35, 70), (70, 60), (120, 55), (150, 45), (135, 8), (75, 5), (45, 24), (20, 34)],
+        [(-18, 35), (50, 32), (48, -34), (18, -36), (-12, 5)],
+        [(108, -10), (154, -12), (151, -42), (115, -36)],
+        [(-10, 50), (5, 61), (31, 61), (42, 45), (18, 36), (0, 42)],
+    ]
+    for poly in land_polygons:
+        ax.add_patch(Polygon(poly, closed=True, facecolor="#e7e2d1", edgecolor="#b8b0a0", linewidth=0.6, alpha=0.65, zorder=0))
+    ax.grid(True, color="#b8ced8", linewidth=0.7, alpha=0.7)
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+
+
+def render_beast2_phylogeography_map(tree, tip_dates: Dict[str, float],
+                                     tip_coordinates: Dict[str, Dict[str, object]],
+                                     metadata: Dict[str, Dict[str, str]],
+                                     pdf_path: Path, png_path: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import Normalize
+    from matplotlib.ticker import MaxNLocator
+
+    try:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+    except ImportError as exc:
+        raise RuntimeError(
+            "Cannot render the BEAST 2 real-world map because cartopy is not installed. "
+            "Install it with: conda install -c conda-forge cartopy"
+        ) from exc
+
+    dated_tips = [name for name in tip_coordinates if name in tip_dates]
+    if not dated_tips:
+        raise RuntimeError("Cannot render BEAST 2 map: no dated tips with coordinates")
+
+    all_lons = [float(tip_coordinates[name]["lon"]) for name in dated_tips]
+    all_lats = [float(tip_coordinates[name]["lat"]) for name in dated_tips]
+    lon_span = max(all_lons) - min(all_lons)
+    lat_span = max(all_lats) - min(all_lats)
+
+    lon_margin = max(8.0, lon_span * 0.08)
+    lon_min = max(-180.0, min(all_lons) - lon_margin)
+    lon_max = min(180.0, max(all_lons) + lon_margin)
+
+    if lon_span > 140.0:
+        lat_center = (min(all_lats) + max(all_lats)) / 2.0
+        min_visible_lat_span = 64.0
+        lat_min = max(-20.0, min(all_lats) - 10.0, lat_center - min_visible_lat_span / 2.0)
+        lat_max = min(80.0, max(all_lats) + 10.0, lat_center + min_visible_lat_span / 2.0)
+        if lat_max - lat_min < min_visible_lat_span:
+            extra = (min_visible_lat_span - (lat_max - lat_min)) / 2.0
+            lat_min = max(-20.0, lat_min - extra)
+            lat_max = min(80.0, lat_max + extra)
+    else:
+        lat_margin = max(5.0, lat_span * 0.22)
+        lat_min = max(-70.0, min(all_lats) - lat_margin)
+        lat_max = min(85.0, max(all_lats) + lat_margin)
+
+    date_values = [tip_dates[name] for name in dated_tips]
+    norm = Normalize(vmin=min(date_values), vmax=max(date_values))
+    cmap = plt.get_cmap("viridis")
+    data_crs = ccrs.PlateCarree()
+
+    fig = plt.figure(figsize=(18.5, 8.6))
+    ax = fig.add_axes([0.045, 0.19, 0.91, 0.73], projection=data_crs)
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=data_crs)
+
+    try:
+        ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor="#eaf4fb", zorder=0)
+        ax.add_feature(cfeature.LAND.with_scale("50m"), facecolor="#f3efe3", edgecolor="none", zorder=0)
+        ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="#5f6f73", linewidth=0.6, zorder=1)
+        ax.add_feature(cfeature.BORDERS.with_scale("50m"), edgecolor="#8a8177", linewidth=0.45, zorder=1)
+        ax.add_feature(cfeature.LAKES.with_scale("50m"), facecolor="#dcecf4", edgecolor="#b6cbd4", linewidth=0.28, zorder=1)
+        admin1 = cfeature.NaturalEarthFeature(
+            "cultural",
+            "admin_1_states_provinces_lines",
+            "50m",
+            facecolor="none",
+        )
+        ax.add_feature(admin1, edgecolor="#b6aea0", linewidth=0.28, alpha=0.72, zorder=1)
+    except Exception as exc:
+        raise RuntimeError(
+            "Cartopy is installed, but Natural Earth map data could not be loaded. "
+            "Run once with internet access so Cartopy can cache the map layers."
+        ) from exc
+
+    gl = ax.gridlines(draw_labels=True, linewidth=0.45, color="#a8bfca", alpha=0.75, linestyle="-")
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xlabel_style = {"size": 10}
+    gl.ylabel_style = {"size": 10}
+
+    segments = []
+    segment_dates = []
+    for parent in tree.find_clades(order="preorder"):
+        parent_coord = getattr(parent, "_beast_coord", None)
+        if parent_coord is None:
+            continue
+        for child in parent.clades:
+            child_coord = getattr(child, "_beast_coord", None)
+            if child_coord is None:
+                continue
+            segments.append([parent_coord, child_coord])
+            segment_dates.append(getattr(child, "_beast_date", getattr(parent, "_beast_date", min(date_values))))
+    if segments:
+        lc = LineCollection(
+            segments,
+            colors=[cmap(norm(value)) for value in segment_dates],
+            linewidths=1.05,
+            alpha=0.34,
+            transform=data_crs,
+            zorder=2,
+        )
+        ax.add_collection(lc)
+
+    location_groups: Dict[str, Dict[str, object]] = {}
+    for sequence_id in dated_tips:
+        row = tip_coordinates[sequence_id]
+        label = str(row.get("location_label") or sequence_id)
+        group = location_groups.setdefault(label, {
+            "lon": float(row["lon"]),
+            "lat": float(row["lat"]),
+            "count": 0,
+            "dates": [],
+            "local_count": 0,
+        })
+        group["count"] = int(group["count"]) + 1
+        group["dates"].append(tip_dates[sequence_id])
+        if is_local_beast2_tip(sequence_id, metadata):
+            group["local_count"] = int(group["local_count"]) + 1
+
+    for label, group in location_groups.items():
+        count = int(group["count"])
+        local_count = int(group["local_count"])
+        mean_date = sum(group["dates"]) / len(group["dates"])
+        size = 42 + min(430, count * 18)
+        edge = "#c0392b" if local_count else "#1f2d3a"
+        linewidth = 2.2 if local_count else 0.85
+        ax.scatter(
+            [group["lon"]],
+            [group["lat"]],
+            s=size,
+            color=[cmap(norm(mean_date))],
+            edgecolor=edge,
+            linewidth=linewidth,
+            alpha=0.96,
+            transform=data_crs,
+            zorder=4,
+        )
+        if local_count or count >= 3:
+            short_label = label.split("|")[-1].strip() or label.split("|")[0].strip()
+            short_label = short_label.replace("__", "_")
+            if len(short_label) > 27:
+                short_label = short_label[:24] + "..."
+            ax.text(
+                float(group["lon"]) + 0.75,
+                float(group["lat"]) + 0.55,
+                f"{short_label} ({count})",
+                fontsize=8.8,
+                color="#1f2d3a",
+                transform=data_crs,
+                zorder=5,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.58, "pad": 1.4},
+            )
+
+    ax.set_title("BEAST 2 MCC phylogeography map", fontsize=18, pad=14)
+    scalar = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    scalar.set_array([])
+    cax = fig.add_axes([0.22, 0.072, 0.56, 0.038])
+    cbar = fig.colorbar(scalar, cax=cax, orientation="horizontal")
+    cbar.locator = MaxNLocator(nbins=7)
+    cbar.update_ticks()
+    cbar.ax.tick_params(labelsize=11, length=4, pad=4)
+    cbar.set_label("Sampling / inferred branch time (decimal year)", fontsize=12, labelpad=8)
+    ax.text(
+        0.01,
+        0.018,
+        "Map base: Natural Earth via Cartopy. Internal node coordinates are descendant-tip centroids for visualization.",
+        transform=ax.transAxes,
+        fontsize=9,
+        color="#34495e",
+        ha="left",
+        va="bottom",
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 3.5},
+    )
+    fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight", pad_inches=0.08)
+    fig.savefig(str(png_path), format="png", dpi=320, bbox_inches="tight", pad_inches=0.08)
+    plt.close(fig)
+
+
+
+def render_beast2_interactive_map(tree, tip_dates: Dict[str, float],
+                                  tip_coordinates: Dict[str, Dict[str, object]],
+                                  metadata: Dict[str, Dict[str, str]],
+                                  html_path: Path) -> None:
+    import json
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    dated_tips = [name for name in tip_coordinates if name in tip_dates]
+    if not dated_tips:
+        raise RuntimeError("Cannot render BEAST 2 interactive map: no dated tips with coordinates")
+
+    date_values = [tip_dates[name] for name in dated_tips]
+    date_min = min(date_values)
+    date_max = max(date_values)
+    norm = Normalize(vmin=date_min, vmax=date_max)
+    cmap = plt.get_cmap("viridis")
+
+    def color_for(value: float) -> str:
+        rgba = cmap(norm(value))
+        return "#{:02x}{:02x}{:02x}".format(
+            int(rgba[0] * 255),
+            int(rgba[1] * 255),
+            int(rgba[2] * 255),
+        )
+
+    location_groups: Dict[str, Dict[str, object]] = {}
+    for sequence_id in dated_tips:
+        row = tip_coordinates[sequence_id]
+        label = str(row.get("location_label") or sequence_id)
+        group = location_groups.setdefault(label, {
+            "label": label,
+            "lon": float(row["lon"]),
+            "lat": float(row["lat"]),
+            "count": 0,
+            "dates": [],
+            "local_count": 0,
+            "reference_count": 0,
+            "sequences": [],
+        })
+        group["count"] = int(group["count"]) + 1
+        group["dates"].append(tip_dates[sequence_id])
+        row_meta = metadata.get(sequence_id, {})
+        is_local = is_local_beast2_tip(sequence_id, metadata)
+        if is_local:
+            group["local_count"] = int(group["local_count"]) + 1
+        else:
+            group["reference_count"] = int(group["reference_count"]) + 1
+        group["sequences"].append({
+            "id": sequence_id,
+            "date": round(float(tip_dates[sequence_id]), 6),
+            "record_type": "local" if is_local else "reference",
+            "accession": row_meta.get("accession", ""),
+            "isolate": row_meta.get("isolate", ""),
+            "country": row_meta.get("country", ""),
+            "region": row_meta.get("region", ""),
+            "locality": row_meta.get("locality", ""),
+            "sample_type": row_meta.get("sample_type", ""),
+            "collection_date": row_meta.get("collection_date", ""),
+        })
+
+    locations = []
+    for label, group in sorted(location_groups.items()):
+        dates = [float(value) for value in group["dates"]]
+        mean_date = sum(dates) / len(dates)
+        sequences = sorted(group["sequences"], key=lambda item: (item["record_type"], item["id"]))
+        locations.append({
+            "label": label,
+            "lat": round(float(group["lat"]), 8),
+            "lon": round(float(group["lon"]), 8),
+            "count": int(group["count"]),
+            "local_count": int(group["local_count"]),
+            "reference_count": int(group["reference_count"]),
+            "mean_date": round(mean_date, 6),
+            "min_date": round(min(dates), 6),
+            "max_date": round(max(dates), 6),
+            "color": color_for(mean_date),
+            "sequences": sequences,
+        })
+
+    edges = []
+    for parent in tree.find_clades(order="preorder"):
+        parent_coord = getattr(parent, "_beast_coord", None)
+        if parent_coord is None:
+            continue
+        for child in parent.clades:
+            child_coord = getattr(child, "_beast_coord", None)
+            if child_coord is None:
+                continue
+            child_date = float(getattr(child, "_beast_date", getattr(parent, "_beast_date", date_min)))
+            edges.append({
+                "parent_lat": round(float(parent_coord[1]), 8),
+                "parent_lon": round(float(parent_coord[0]), 8),
+                "child_lat": round(float(child_coord[1]), 8),
+                "child_lon": round(float(child_coord[0]), 8),
+                "date": round(child_date, 6),
+                "color": color_for(child_date),
+                "child_is_tip": bool(child.is_terminal()),
+                "posterior": None if getattr(child, "_beast_posterior", None) is None else round(float(child._beast_posterior), 6),
+            })
+
+    center_lat = sum(item["lat"] for item in locations) / len(locations)
+    center_lon = sum(item["lon"] for item in locations) / len(locations)
+    max_count = max(item["count"] for item in locations)
+
+    payload = {
+        "locations": locations,
+        "edges": edges,
+        "center": [round(center_lat, 8), round(center_lon, 8)],
+        "date_min": round(date_min, 6),
+        "date_max": round(date_max, 6),
+        "max_count": int(max_count),
+    }
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
+    html_template = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BEAST 2 MCC interactive phylogeography map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body, #map {
+      height: 100%;
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .panel, .legend {
+      position: absolute;
+      z-index: 1000;
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid rgba(30, 45, 55, 0.18);
+      border-radius: 8px;
+      box-shadow: 0 8px 22px rgba(0, 0, 0, 0.14);
+      color: #263238;
+    }
+    .panel {
+      left: 14px;
+      top: 14px;
+      width: min(405px, calc(100vw - 28px));
+    }
+    .panel.collapsed {
+      width: auto;
+    }
+    .panel-header, .legend-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      font-weight: 700;
+      font-size: 13px;
+      color: #17202a;
+    }
+    .panel-body {
+      padding: 0 10px 10px;
+    }
+    .panel.collapsed .panel-body,
+    .legend.collapsed .legend-body {
+      display: none;
+    }
+    .panel p, .legend p {
+      font-size: 12px;
+      line-height: 1.35;
+      margin: 7px 0 0;
+      color: #34495e;
+    }
+    .mini-button {
+      border: 0;
+      border-radius: 6px;
+      padding: 5px 8px;
+      background: #1f6f8b;
+      color: white;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .search-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 9px;
+    }
+    .search-row input {
+      flex: 1;
+      border: 1px solid #b7c3ca;
+      border-radius: 6px;
+      padding: 7px 8px;
+      font-size: 13px;
+      min-width: 0;
+    }
+    .legend {
+      right: 14px;
+      bottom: 18px;
+      width: min(360px, calc(100vw - 28px));
+      font-size: 12px;
+    }
+    .legend.collapsed {
+      width: auto;
+    }
+    .legend-body {
+      padding: 0 12px 12px;
+    }
+    .gradient {
+      height: 13px;
+      border-radius: 8px;
+      background: linear-gradient(to right, #440154, #3b528b, #21918c, #5ec962, #fde725);
+      margin: 7px 0 4px;
+    }
+    .legend-scale {
+      display: flex;
+      justify-content: space-between;
+      font-variant-numeric: tabular-nums;
+    }
+    .popup-title {
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: #17202a;
+    }
+    .popup-meta {
+      font-size: 12px;
+      line-height: 1.35;
+      color: #263238;
+      margin-bottom: 6px;
+    }
+    .popup-list {
+      max-height: 190px;
+      overflow-y: auto;
+      border-top: 1px solid #d9e1e5;
+      padding-top: 5px;
+      font-size: 11.5px;
+      line-height: 1.35;
+    }
+    .local {
+      color: #a93226;
+      font-weight: 700;
+    }
+    .leaflet-control-layers {
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel collapsed" id="infoPanel">
+    <div class="panel-header">
+      <span>BEAST 2 MCC map</span>
+      <button class="mini-button" id="panelToggle">Tools</button>
+    </div>
+    <div class="panel-body">
+      <p>Zoom freely into any region. Red outlines mark local assemblies; fill color follows sampling or inferred branch time.</p>
+      <div class="search-row">
+        <input id="search" type="search" placeholder="Search isolate, accession, country, locality...">
+        <button class="mini-button" id="searchButton">Zoom</button>
+        <button class="mini-button" id="resetButton" title="Reset map view">Reset</button>
+      </div>
+      <p id="searchStatus"></p>
+    </div>
+  </div>
+  <div class="legend collapsed" id="legendPanel">
+    <div class="legend-header">
+      <span>Time scale</span>
+      <button class="mini-button" id="legendToggle">Show</button>
+    </div>
+    <div class="legend-body">
+      <strong>Sampling / inferred branch time</strong>
+      <div class="gradient"></div>
+      <div class="legend-scale">
+        <span>__DATE_MIN__</span>
+        <span>__DATE_MAX__</span>
+      </div>
+      <p>Branches are drawn with a white halo plus a colored MCC line. Circle size is proportional to the number of sequences at a location.</p>
+    </div>
+  </div>
+  <script>
+    const DATA = __PAYLOAD_JSON__;
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function popupContent(loc) {
+      const rows = loc.sequences.map(seq => {
+        const cls = seq.record_type === "local" ? "local" : "";
+        const label = seq.collection_date ? `${seq.id} · ${seq.collection_date}` : `${seq.id} · ${seq.date}`;
+        const details = [seq.country, seq.region, seq.locality, seq.sample_type].filter(Boolean).join(" / ");
+        return `<div class="${cls}">${escapeHtml(label)}${details ? `<br><span>${escapeHtml(details)}</span>` : ""}</div>`;
+      }).join("");
+      return `
+        <div class="popup-title">${escapeHtml(loc.label)}</div>
+        <div class="popup-meta">
+          <strong>${loc.count}</strong> sequence(s): ${loc.local_count} local, ${loc.reference_count} reference<br>
+          Mean date: ${loc.mean_date.toFixed(3)}<br>
+          Date range: ${loc.min_date.toFixed(3)} - ${loc.max_date.toFixed(3)}<br>
+          Coordinates: ${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)}
+        </div>
+        <div class="popup-list">${rows}</div>
+      `;
+    }
+
+    const map = L.map("map", { preferCanvas: true }).setView(DATA.center, 3);
+    map.createPane("branches");
+    map.getPane("branches").style.zIndex = 430;
+    map.createPane("samples");
+    map.getPane("samples").style.zIndex = 460;
+
+    const cleanBase = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png", {
+      maxZoom: 20,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+    }).addTo(map);
+    const labelOverlay = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png", {
+      maxZoom: 20,
+      attribution: '&copy; <a href="https://carto.com/attributions">CARTO</a>'
+    });
+    const osm = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    });
+
+    const mccBranchLayer = L.layerGroup().addTo(map);
+    const samplingLayer = L.layerGroup().addTo(map);
+    const localLayer = L.layerGroup();
+    const referenceLayer = L.layerGroup();
+
+    DATA.edges.forEach(edge => {
+      const points = [[edge.parent_lat, edge.parent_lon], [edge.child_lat, edge.child_lon]];
+      L.polyline(points, {
+        pane: "branches",
+        color: "#ffffff",
+        weight: edge.child_is_tip ? 6.2 : 5.2,
+        opacity: 0.78,
+        smoothFactor: 0
+      }).addTo(mccBranchLayer);
+      L.polyline(points, {
+        pane: "branches",
+        color: edge.color,
+        weight: edge.child_is_tip ? 3.15 : 2.45,
+        opacity: 0.98,
+        smoothFactor: 0
+      }).addTo(mccBranchLayer);
+    });
+
+    const searchable = [];
+    const bounds = [];
+    DATA.locations.forEach(loc => {
+      const radius = Math.max(6, Math.min(28, 5 + Math.sqrt(loc.count) * 4.0));
+      const style = {
+        pane: "samples",
+        radius,
+        fillColor: loc.color,
+        color: loc.local_count > 0 ? "#c0392b" : "#1f2d3a",
+        weight: loc.local_count > 0 ? 3.2 : 1.1,
+        opacity: 0.98,
+        fillOpacity: 0.86
+      };
+      const marker = L.circleMarker([loc.lat, loc.lon], style).bindPopup(popupContent(loc), { maxWidth: 410 });
+      marker.addTo(samplingLayer);
+      if (loc.local_count > 0) marker.addTo(localLayer);
+      if (loc.reference_count > 0) marker.addTo(referenceLayer);
+      const searchText = [
+        loc.label,
+        ...loc.sequences.flatMap(seq => [seq.id, seq.accession, seq.isolate, seq.country, seq.region, seq.locality, seq.sample_type])
+      ].join(" ").toLowerCase();
+      searchable.push({ loc, marker, searchText });
+      bounds.push([loc.lat, loc.lon]);
+    });
+
+    if (bounds.length > 0) {
+      map.fitBounds(bounds, { padding: [34, 34], maxZoom: 5 });
+    }
+
+    L.control.layers(
+      {
+        "Clean map": cleanBase,
+        "OpenStreetMap": osm
+      },
+      {
+        "Map labels": labelOverlay,
+        "MCC branches": mccBranchLayer,
+        "Sampling locations": samplingLayer,
+        "Local assemblies": localLayer,
+        "Reference genomes": referenceLayer
+      },
+      { collapsed: true }
+    ).addTo(map);
+
+    const originalBounds = bounds.length > 0 ? L.latLngBounds(bounds) : null;
+    const searchInput = document.getElementById("search");
+    const searchStatus = document.getElementById("searchStatus");
+    const infoPanel = document.getElementById("infoPanel");
+    const legendPanel = document.getElementById("legendPanel");
+    const panelToggle = document.getElementById("panelToggle");
+    const legendToggle = document.getElementById("legendToggle");
+
+    panelToggle.addEventListener("click", () => {
+      infoPanel.classList.toggle("collapsed");
+      panelToggle.textContent = infoPanel.classList.contains("collapsed") ? "Tools" : "Hide";
+    });
+    legendToggle.addEventListener("click", () => {
+      legendPanel.classList.toggle("collapsed");
+      legendToggle.textContent = legendPanel.classList.contains("collapsed") ? "Show" : "Hide";
+    });
+
+    function runSearch() {
+      const query = searchInput.value.trim().toLowerCase();
+      if (!query) {
+        searchStatus.textContent = "";
+        return;
+      }
+      const matches = searchable.filter(item => item.searchText.includes(query));
+      if (matches.length === 0) {
+        searchStatus.textContent = "No matching isolate or location found.";
+        return;
+      }
+      const first = matches[0];
+      const zoom = first.loc.local_count > 0 ? 10 : 6;
+      map.flyTo([first.loc.lat, first.loc.lon], zoom, { duration: 0.8 });
+      first.marker.openPopup();
+      searchStatus.textContent = `${matches.length} match(es). Showing: ${first.loc.label}`;
+    }
+
+    document.getElementById("searchButton").addEventListener("click", runSearch);
+    searchInput.addEventListener("keydown", event => {
+      if (event.key === "Enter") runSearch();
+    });
+    document.getElementById("resetButton").addEventListener("click", () => {
+      if (originalBounds) map.fitBounds(originalBounds, { padding: [34, 34], maxZoom: 5 });
+      searchInput.value = "";
+      searchStatus.textContent = "";
+    });
+  </script>
+</body>
+</html>
+"""
+    html = (
+        html_template
+        .replace("__PAYLOAD_JSON__", payload_json)
+        .replace("__DATE_MIN__", f"{date_min:.2f}")
+        .replace("__DATE_MAX__", f"{date_max:.2f}")
+    )
+    html_path.write_text(html, encoding="utf-8")
+    plt.close("all")
+
+
+
+def assign_beast2_time_tree_y_positions(tree) -> int:
+    counter = {"y": 0}
+
+    def visit(clade):
+        if clade.is_terminal():
+            clade._plot_y = counter["y"]
+            counter["y"] += 1
+            return clade._plot_y
+        child_y = [visit(child) for child in clade.clades]
+        clade._plot_y = sum(child_y) / len(child_y) if child_y else counter["y"]
+        return clade._plot_y
+
+    visit(tree.root)
+    return counter["y"]
+
+
+def render_beast2_time_tree(tree, metadata: Dict[str, Dict[str, str]],
+                            pdf_path: Path, png_path: Path) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    tip_count = assign_beast2_time_tree_y_positions(tree)
+    terminals = tree.get_terminals()
+    tip_dates = [getattr(tip, "_beast_date", None) for tip in terminals]
+    tip_dates = [float(value) for value in tip_dates if value is not None]
+    if not tip_dates:
+        raise RuntimeError("Cannot render BEAST 2 time tree: no terminal sampling dates found")
+
+    min_tip_date = min(tip_dates)
+    max_tip_date = max(tip_dates)
+    date_span = max(1.0, max_tip_date - min_tip_date)
+    margin = max(0.5, date_span * 0.035)
+
+    def display_date(value: float | None) -> float:
+        if value is None:
+            return min_tip_date
+        return max(float(value), min_tip_date)
+
+    fig_width = 16
+    fig_height = max(10, min(48, tip_count * 0.34))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    for parent in tree.find_clades(order="preorder"):
+        if not parent.clades:
+            continue
+        parent_x = display_date(getattr(parent, "_beast_date", min_tip_date))
+        child_ys = [getattr(child, "_plot_y", 0.0) for child in parent.clades]
+        ax.plot([parent_x, parent_x], [min(child_ys), max(child_ys)], color="#5d6d7e", linewidth=0.8, alpha=0.75)
+        for child in parent.clades:
+            child_x = display_date(getattr(child, "_beast_date", parent_x))
+            child_y = getattr(child, "_plot_y", 0.0)
+            local = child.is_terminal() and is_local_beast2_tip(child.name or "", metadata)
+            linewidth = 1.35 if local else 0.8
+            color = "#b03a2e" if local else "#5d6d7e"
+            ax.plot([parent_x, child_x], [child_y, child_y], color=color, linewidth=linewidth, alpha=0.88)
+
+    for tip in terminals:
+        x = display_date(getattr(tip, "_beast_date", max_tip_date))
+        y = getattr(tip, "_plot_y", 0.0)
+        local = is_local_beast2_tip(tip.name or "", metadata)
+        ax.scatter([x], [y], s=18 if local else 9, color="#b03a2e" if local else "#263238", zorder=3)
+        ax.text(
+            max_tip_date + margin * 0.25,
+            y,
+            tip.name or "",
+            fontsize=6.3,
+            va="center",
+            color="#b03a2e" if local else "#263238",
+            fontweight="bold" if local else "normal",
+        )
+
+    ax.axvline(min_tip_date, color="#85929e", linewidth=0.8, linestyle="--", alpha=0.8)
+    ax.set_title("BEAST 2 MCC time tree (sample-date window)", fontsize=14, pad=12)
+    ax.set_xlabel("Sampling year (decimal year)")
+    ax.set_yticks([])
+    ax.set_ylim(-1, tip_count)
+    ax.set_xlim(min_tip_date - margin, max_tip_date + margin * 2.8)
+    ax.grid(axis="x", color="#d5dce2", linewidth=0.7)
+    ax.text(
+        min_tip_date,
+        -0.8,
+        f"Earliest sampled isolate: {min_tip_date:.2f}",
+        fontsize=8,
+        color="#5d6d7e",
+        ha="left",
+        va="bottom",
+    )
+    legend_handles = [
+        Line2D([0], [0], color="#b03a2e", lw=1.6, marker="o", markersize=5, label="Local isolates"),
+        Line2D([0], [0], color="#5d6d7e", lw=1.2, marker="o", markersize=4, label="Reference genomes"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper left", frameon=False, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
+    fig.savefig(str(png_path), format="png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def render_beast2_visual_outputs(shared_layout: Dict[str, Path]) -> None:
+    import os
+
+    prep_outputs = beast2_outputs(shared_layout)
+    run_outputs = beast2_run_outputs(shared_layout)
+    mpl_config = run_outputs["outdir"] / ".matplotlib"
+    mkdir(mpl_config)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_config))
+
+    tree = read_beast2_mcc_tree(run_outputs["mcc_tree"])
+    tip_dates = read_beast2_tip_dates_table(prep_outputs["tip_dates"])
+    tip_coordinates = read_beast2_sequence_coordinates(prep_outputs["sequence_coordinates"])
+    metadata = read_beast2_metadata_table(prep_outputs["metadata"])
+
+    annotate_beast2_tree_for_visuals(tree, tip_dates, tip_coordinates)
+    write_beast2_phylogeography_edges(tree, run_outputs["map_edges_tsv"])
+    render_beast2_phylogeography_map(
+        tree,
+        tip_dates,
+        tip_coordinates,
+        metadata,
+        run_outputs["map_pdf"],
+        run_outputs["map_png"],
+    )
+    render_beast2_interactive_map(
+        tree,
+        tip_dates,
+        tip_coordinates,
+        metadata,
+        run_outputs["map_html"],
+    )
+    render_beast2_time_tree(tree, metadata, run_outputs["time_tree_pdf"], run_outputs["time_tree_png"])
+    run_outputs["visuals_version"].write_text("beast2_visuals_v6\n", encoding="utf-8")
+
+    with open(run_outputs["log"], "a", encoding="utf-8") as logh:
+        logh.write(f"[{now()}] BEAST 2 phylogeography map PDF written to: {run_outputs['map_pdf']}\n")
+        logh.write(f"[{now()}] BEAST 2 phylogeography map PNG written to: {run_outputs['map_png']}\n")
+        logh.write(f"[{now()}] BEAST 2 interactive phylogeography HTML written to: {run_outputs['map_html']}\n")
+        logh.write(f"[{now()}] BEAST 2 time tree PDF written to: {run_outputs['time_tree_pdf']}\n")
+        logh.write(f"[{now()}] BEAST 2 time tree PNG written to: {run_outputs['time_tree_png']}\n")
+        logh.write(f"[{now()}] BEAST 2 phylogeography edge table written to: {run_outputs['map_edges_tsv']}\n")
 
 
 # ---------------------------------------------------------------------
@@ -2583,6 +3827,8 @@ def run_global_phylogeny(shared_layout: Dict[str, Path], sample_layouts: List[Di
                      args.beast2_xml,
                      args.threads,
                      args.beast2_burnin,
+                     args.beast2_chain_length,
+                     args.beast2_log_every,
                  ))
         )
     steps.extend([
@@ -2660,6 +3906,8 @@ def run_pipeline(args) -> None:
         beast2_run = beast2_run_outputs(shared_layout)
         print_status_line("BEAST 2 run folder", summarize_path(beast2_run["outdir"]), "green")
         print_status_line("BEAST 2 MCC tree", summarize_path(beast2_run["mcc_tree"]), "green")
+        print_status_line("BEAST 2 phylogeography map", summarize_path(beast2_run["map_pdf"]), "green")
+        print_status_line("BEAST 2 time tree", summarize_path(beast2_run["time_tree_pdf"]), "green")
 
 
 def main() -> None:
