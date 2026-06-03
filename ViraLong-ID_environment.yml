@@ -3,10 +3,12 @@ channels:
   - conda-forge
   - bioconda
   - defaults
+
 dependencies:
   - python=3.11
   - biopython
   - matplotlib
+  - cartopy
   - ncbi-datasets-cli
   - blast
   - fastplong
@@ -14,6 +16,6 @@ dependencies:
   - mafft
   - trimal
   - iqtree
-  - beast2
+  - openjdk=17
   - unzip
   - pip
