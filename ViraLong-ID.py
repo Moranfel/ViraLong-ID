@@ -3352,6 +3352,19 @@ def is_assembled_tip(label: str) -> bool:
     return "__" in label
 
 
+def is_bootstrap_label(label: str) -> bool:
+    clean = label.strip()
+    if not clean:
+        return False
+    if "/" in clean:
+        return all(is_bootstrap_label(part) for part in clean.split("/") if part.strip())
+    try:
+        value = float(clean)
+    except ValueError:
+        return False
+    return 0.0 <= value <= 100.0
+
+
 def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
     from Bio import Phylo
     import matplotlib
@@ -3362,11 +3375,27 @@ def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
 
     tree = Phylo.read(str(treefile), "newick")
     terminals = max(1, len(tree.get_terminals()))
-    fig_width = max(12, min(36, terminals * 0.35))
-    fig_height = max(8, min(42, terminals * 0.45))
+    fig_width = max(14, min(42, terminals * 0.45))
+    fig_height = max(9, min(52, terminals * 0.55))
+    tip_font_size = max(7.5, min(10.5, 13.0 - terminals * 0.055))
+    sample_font_size = min(12.0, tip_font_size + 1.3)
+    bootstrap_font_size = max(8.0, min(11.0, tip_font_size + 1.0))
+
     fig = plt.figure(figsize=(fig_width, fig_height))
     ax = fig.add_subplot(1, 1, 1)
     Phylo.draw(tree, axes=ax, do_show=False)
+
+    for line in ax.get_lines():
+        line.set_color("#4d5656")
+        line.set_linewidth(0.9)
+        line.set_alpha(0.92)
+    for collection in ax.collections:
+        try:
+            collection.set_color("#4d5656")
+            collection.set_linewidth(0.9)
+            collection.set_alpha(0.92)
+        except Exception:
+            pass
 
     for text in ax.texts:
         label = text.get_text().strip()
@@ -3375,18 +3404,31 @@ def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
         if is_assembled_tip(label):
             text.set_color("#c0392b")
             text.set_fontweight("bold")
+            text.set_fontsize(sample_font_size)
+            text.set_zorder(5)
+        elif is_bootstrap_label(label):
+            text.set_color("#17202a")
+            text.set_fontweight("bold")
+            text.set_fontsize(bootstrap_font_size)
+            text.set_zorder(6)
+            text.set_bbox({"facecolor": "white", "edgecolor": "none", "alpha": 0.78, "pad": 0.35})
         else:
-            text.set_color("#1f1f1f")
+            text.set_color("#283747")
+            text.set_fontsize(tip_font_size)
+            text.set_fontweight("normal")
 
     legend_handles = [
-        Line2D([0], [0], color="#c0392b", lw=0, marker="o", markersize=7, label="Assembled isolates"),
-        Line2D([0], [0], color="#1f1f1f", lw=0, marker="o", markersize=7, label="Reference genomes"),
+        Line2D([0], [0], color="#c0392b", lw=0, marker="o", markersize=7, label="Samples analyzed"),
+        Line2D([0], [0], color="#283747", lw=0, marker="o", markersize=7, label="Reference genomes"),
+        Line2D([0], [0], color="#17202a", lw=0, marker="$99$", markersize=10, label="Bootstrap support"),
     ]
-    ax.legend(handles=legend_handles, loc="upper right", frameon=False, fontsize=9)
+    ax.legend(handles=legend_handles, loc="upper right", frameon=False, fontsize=max(9, tip_font_size))
+    ax.set_title("Maximum-likelihood phylogeny", fontsize=14, fontweight="bold", pad=12)
 
     fig.tight_layout()
     fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
     plt.close(fig)
+
 
 
 def step12_iqtree(shared_layout: Dict[str, Path], threads: int) -> None:
