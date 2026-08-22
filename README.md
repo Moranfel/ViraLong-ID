@@ -1,4 +1,4 @@
-# 🦠 ViraLong-ID v5.7
+# 🦠 ViraLong-ID v6.0
 
 **ViraLong-ID** is a long-read viral identification and phylogeny pipeline for multi-sample batches. It takes ONT-style long-read data from raw reads to viral contigs, global alignments, identity heatmaps, and maximum-likelihood trees.
 
