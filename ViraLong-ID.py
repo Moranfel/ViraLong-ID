@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ViraLong-ID v5.7
+ViraLong-ID v.6.0
 Long-read viral identification and phylogeny pipeline.
 
 Main features
@@ -33,6 +33,8 @@ Pipeline
 from __future__ import annotations
 
 import argparse
+import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import gzip
 import os
@@ -54,7 +56,7 @@ except ImportError:
 
 
 PIPELINE_NAME = "ViraLong-ID"
-PIPELINE_VERSION = "5.6-batch"
+PIPELINE_VERSION = "6.0-batch"
 
 
 # ---------------------------------------------------------------------
@@ -355,16 +357,17 @@ def make_shared_layout(base: Path) -> Dict[str, Path]:
     layout = {
         "logs": base / "00_logs",
         "refs": base / "01_references",
-        "blast_db": base / "05_blast_database",
-        "combined": base / "06_combined_target_contigs",
-        "aln": base / "07_phylogeny_alignment",
-        "identity": base / "07b_pairwise_identity",
-        "tree": base / "08_phylogeny_tree",
+        "blast_db": base / "02_blast_database",
+        "samples": base / "03_samples",
+        "combined": base / "04_combined_target_contigs",
+        "aln": base / "05_phylogeny_alignment",
+        "identity": base / "06_pairwise_identity",
+        "tree": base / "07_phylogeny_tree",
+        "assembled_ref_tree": base / "08_phylogeny_tree_assembled_plus_reference",
         "report": base / "09_report",
         "beast2": base / "10_beast2_preparation",
         "beast2_run": base / "11_beast2_run",
-        "samples": base / "samples",
-        "tmp": base / "tmp",
+        "tmp": base / "12_tmp",
     }
     for p in layout.values():
         mkdir(p)
@@ -376,14 +379,14 @@ def make_sample_layout(shared_layout: Dict[str, Path], sample_name: str) -> Dict
     layout = {
         "base": base,
         "logs": base / "00_logs",
-        "qc": base / "02_reads_qc",
-        "renamed_reads": base / "03_reads_renamed",
-        "assembly_reads": base / "03b_reads_for_assembly",
+        "qc": base / "01_reads_qc",
+        "renamed_reads": base / "02_reads_renamed",
+        "assembly_reads": base / "03_reads_for_assembly",
         "assembly": base / "04_assembly_flye",
         "blast": base / "05_blast_identification",
         "target": base / "06_taxon_filtered_contigs",
-        "report": base / "09_report",
-        "tmp": base / "tmp",
+        "report": base / "07_report",
+        "tmp": base / "08_tmp",
     }
     for p in layout.values():
         mkdir(p)
@@ -428,6 +431,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_options.add_argument("--sample-names", nargs="*",
                              help="🏷️ Optional sample names, same order as --reads")
     run_options.add_argument("--threads", type=int, default=8, help="🧵 Threads")
+    run_options.add_argument("--sample-parallel", type=int, default=1,
+                             help="🚦 Number of samples to process concurrently")
 
     read_qc = p.add_argument_group("Read QC and assembly")
     read_qc.add_argument("--min-q", type=int, default=15,
@@ -466,6 +471,14 @@ def build_parser() -> argparse.ArgumentParser:
                            help="🔄 Automatic strand correction in MAFFT")
     phylogeny.add_argument("--identity-plot-min", type=float, default=None,
                            help="🎨 Minimum value for pairwise identity heatmap color scale")
+    phylogeny.add_argument("--skip-identity-plot", action="store_true",
+                           help="⏭️ Skip pairwise identity matrix and heatmap generation")
+    phylogeny.add_argument("--assembled-reference-tree", action=argparse.BooleanOptionalAction, default=False,
+                           help="🌿 Also infer an ML tree using only assembled target contigs plus one reference genome")
+    phylogeny.add_argument("--assembled-reference-id", default="auto",
+                           help='🧬 Reference accession to include in --assembled-reference-tree, or "auto" to prefer an NC_ RefSeq accession')
+    phylogeny.add_argument("--tree-render-mode", choices=["phylogram", "cladogram"], default="phylogram",
+                           help="🌳 PDF tree rendering mode; phylogram preserves branch lengths")
 
     beast2_prepare = p.add_argument_group("Optional BEAST 2 preparation")
     beast2_prepare.add_argument("--prepare-beast2", action="store_true",
@@ -999,6 +1012,23 @@ def step8_outputs(sample_layout: Dict[str, Path]) -> Tuple[Path, Path]:
     return fasta, tsv
 
 
+def rescue_marker_path(sample_layout: Dict[str, Path]) -> Path:
+    return sample_layout["target"] / "rescue_with_all_qc_reads.done"
+
+
+def rescue_previously_attempted(sample_layout: Dict[str, Path]) -> bool:
+    marker = rescue_marker_path(sample_layout)
+    if marker.exists():
+        return True
+    flye_log = sample_layout["logs"] / "step06_flye.log"
+    if flye_log.exists():
+        try:
+            return "Rescue mode:" in flye_log.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+    return False
+
+
 def step8_done(sample_layout: Dict[str, Path]) -> bool:
     fasta, tsv = step8_outputs(sample_layout)
     return fasta.exists() and tsv.exists()
@@ -1089,7 +1119,13 @@ def rescue_sample_with_all_qc_reads(sample_layout: Dict[str, Path], shared_layou
     )
     step7_blast(sample_layout, shared_layout, threads)
     step8_select_target_contigs(sample_layout, shared_layout, min_pident, min_qcov, sample_name)
-    return count_fasta_records(step8_outputs(sample_layout)[0]) > 0
+    recovered = count_fasta_records(step8_outputs(sample_layout)[0]) > 0
+    with open(rescue_marker_path(sample_layout), "w", encoding="utf-8") as out:
+        out.write(f"sample\t{sample_name}\n")
+        out.write(f"timestamp\t{now()}\n")
+        out.write("rescue_mode\tall_qc_reads_flye_meta\n")
+        out.write(f"target_contigs_recovered\t{int(recovered)}\n")
+    return recovered
 
 
 # ---------------------------------------------------------------------
@@ -3174,25 +3210,55 @@ def render_beast2_visual_outputs(shared_layout: Dict[str, Path]) -> None:
 # Step 11 - Pairwise identity heatmap
 # ---------------------------------------------------------------------
 
-def step11_identity_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path, Path, Path, Path]:
+def step11_identity_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path, Path, Path, Path, Path, Path, Path, Path]:
     matrix_tsv = shared_layout["identity"] / "pairwise_identity.tsv"
     pdf = shared_layout["identity"] / "pairwise_identity_heatmap.pdf"
     png = shared_layout["identity"] / "pairwise_identity_heatmap.png"
+    clustered_pdf = shared_layout["identity"] / "pairwise_identity_heatmap_clustered.pdf"
+    clustered_png = shared_layout["identity"] / "pairwise_identity_heatmap_clustered.png"
     assembled_matrix_tsv = shared_layout["identity"] / "pairwise_identity_assembled_only.tsv"
     assembled_pdf = shared_layout["identity"] / "pairwise_identity_assembled_only_heatmap.pdf"
     assembled_png = shared_layout["identity"] / "pairwise_identity_assembled_only_heatmap.png"
-    return matrix_tsv, pdf, png, assembled_matrix_tsv, assembled_pdf, assembled_png
+    assembled_clustered_pdf = shared_layout["identity"] / "pairwise_identity_assembled_only_heatmap_clustered.pdf"
+    assembled_clustered_png = shared_layout["identity"] / "pairwise_identity_assembled_only_heatmap_clustered.png"
+    return (
+        matrix_tsv,
+        pdf,
+        png,
+        clustered_pdf,
+        clustered_png,
+        assembled_matrix_tsv,
+        assembled_pdf,
+        assembled_png,
+        assembled_clustered_pdf,
+        assembled_clustered_png,
+    )
 
 
 def step11_identity_done(shared_layout: Dict[str, Path]) -> bool:
-    matrix_tsv, pdf, png, assembled_matrix_tsv, assembled_pdf, assembled_png = step11_identity_outputs(shared_layout)
+    (
+        matrix_tsv,
+        pdf,
+        png,
+        clustered_pdf,
+        clustered_png,
+        assembled_matrix_tsv,
+        assembled_pdf,
+        assembled_png,
+        assembled_clustered_pdf,
+        assembled_clustered_png,
+    ) = step11_identity_outputs(shared_layout)
     return (
         matrix_tsv.exists()
         and pdf.exists()
         and png.exists()
+        and clustered_pdf.exists()
+        and clustered_png.exists()
         and assembled_matrix_tsv.exists()
         and assembled_pdf.exists()
         and assembled_png.exists()
+        and assembled_clustered_pdf.exists()
+        and assembled_clustered_png.exists()
     )
 
 
@@ -3276,8 +3342,9 @@ def render_identity_heatmap(labels: List[str], matrix: List[List[float]], pdf_pa
     ax.set_title(title, fontsize=14, pad=12)
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
-    ax.set_xticklabels(labels, rotation=90, fontsize=8)
-    ax.set_yticklabels(labels, fontsize=8)
+    display_labels = [clean_tree_display_label(label) for label in labels]
+    ax.set_xticklabels(display_labels, rotation=90, fontsize=8)
+    ax.set_yticklabels(display_labels, fontsize=8)
     ax.set_xticks([x - 0.5 for x in range(1, n)], minor=True)
     ax.set_yticks([y - 0.5 for y in range(1, n)], minor=True)
     ax.grid(which="minor", color="white", linestyle="-", linewidth=0.8)
@@ -3290,12 +3357,264 @@ def render_identity_heatmap(labels: List[str], matrix: List[List[float]], pdf_pa
     plt.close(fig)
 
 
+def cluster_identity_matrix(labels: List[str], matrix: List[List[float]]) -> Tuple[List[int], object]:
+    n = len(labels)
+    if n < 2:
+        return list(range(n)), None
+
+    distances = [[max(0.0, 100.0 - matrix[i][j]) for j in range(n)] for i in range(n)]
+    clusters = [
+        {"indices": [i], "left": None, "right": None, "height": 0.0}
+        for i in range(n)
+    ]
+
+    def average_distance(a, b) -> float:
+        total = 0.0
+        count = 0
+        for i in a["indices"]:
+            for j in b["indices"]:
+                total += distances[i][j]
+                count += 1
+        return total / max(1, count)
+
+    while len(clusters) > 1:
+        best_i = 0
+        best_j = 1
+        best_distance = average_distance(clusters[0], clusters[1])
+        for i in range(len(clusters)):
+            for j in range(i + 1, len(clusters)):
+                current = average_distance(clusters[i], clusters[j])
+                if current < best_distance:
+                    best_i = i
+                    best_j = j
+                    best_distance = current
+        left = clusters[best_i]
+        right = clusters[best_j]
+        merged = {
+            "indices": left["indices"] + right["indices"],
+            "left": left,
+            "right": right,
+            "height": best_distance,
+        }
+        clusters = [cluster for k, cluster in enumerate(clusters) if k not in {best_i, best_j}]
+        clusters.append(merged)
+
+    order: List[int] = []
+
+    def walk(node) -> None:
+        if node["left"] is None and node["right"] is None:
+            order.append(node["indices"][0])
+            return
+        walk(node["left"])
+        walk(node["right"])
+
+    root = clusters[0]
+    walk(root)
+    return order, root
+
+
+def infer_identity_label_country(label: str) -> str:
+    for country in ["Spain", "Italy", "Turkey", "China", "South_Korea", "USA", "India", "Pakistan"]:
+        if country in label:
+            return country.replace("_", " ")
+    return "Other"
+
+
+def identity_country_colors() -> Dict[str, str]:
+    return {
+        "Spain": "#2f6f9f",
+        "Italy": "#5a8f49",
+        "Turkey": "#b07f2f",
+        "China": "#9b4f9f",
+        "South Korea": "#8a8a8a",
+        "USA": "#b85c46",
+        "India": "#3f8f82",
+        "Pakistan": "#8a7a3c",
+        "Other": "#999999",
+    }
+
+
+def render_clustered_identity_heatmap(labels: List[str], matrix: List[List[float]], pdf_path: Path, png_path: Path,
+                                      title: str, vmin: float | None) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.patches import Rectangle
+
+    order, cluster_root = cluster_identity_matrix(labels, matrix)
+    clustered_labels = [labels[i] for i in order]
+    clustered_matrix = [[matrix[i][j] for j in order] for i in order]
+    if cluster_root is None:
+        render_identity_heatmap(clustered_labels, clustered_matrix, pdf_path, png_path, title, vmin)
+        return
+
+    off_diag = [
+        clustered_matrix[i][j]
+        for i in range(len(clustered_matrix))
+        for j in range(len(clustered_matrix))
+        if i != j
+    ]
+    auto_vmin = min(off_diag) if off_diag else 95.0
+    if vmin is None:
+        vmin = max(0.0, round((auto_vmin - 0.2) * 2) / 2)
+
+    n = max(1, len(clustered_labels))
+    fig_w = max(14, min(34, 5.5 + n * 0.46))
+    fig_h = max(12, min(34, 5.7 + n * 0.38))
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = GridSpec(
+        4,
+        3,
+        width_ratios=[1.4, 0.18, 10],
+        height_ratios=[0.75, 1.45, 0.18, 10],
+        wspace=0.02,
+        hspace=0.02,
+    )
+    fig.suptitle(title, fontsize=18, fontweight="bold", y=0.985)
+
+    ax_legend = fig.add_subplot(gs[0, 2])
+    ax_legend.set_axis_off()
+
+    leaf_positions = {label_index: pos for pos, label_index in enumerate(order)}
+
+    def node_position(node) -> float:
+        if node["left"] is None and node["right"] is None:
+            return float(leaf_positions[node["indices"][0]])
+        return (node_position(node["left"]) + node_position(node["right"])) / 2.0
+
+    def draw_top(node, ax) -> None:
+        if node["left"] is None or node["right"] is None:
+            return
+        left = node["left"]
+        right = node["right"]
+        x_left = node_position(left)
+        x_right = node_position(right)
+        x_node = node_position(node)
+        y_left = left["height"]
+        y_right = right["height"]
+        y_node = node["height"]
+        ax.plot([x_left, x_left], [y_left, y_node], color="0.35", linewidth=1.0)
+        ax.plot([x_right, x_right], [y_right, y_node], color="0.35", linewidth=1.0)
+        ax.plot([x_left, x_right], [y_node, y_node], color="0.35", linewidth=1.0)
+        draw_top(left, ax)
+        draw_top(right, ax)
+
+    def draw_left(node, ax) -> None:
+        if node["left"] is None or node["right"] is None:
+            return
+        left = node["left"]
+        right = node["right"]
+        y_left = node_position(left)
+        y_right = node_position(right)
+        x_left = left["height"]
+        x_right = right["height"]
+        x_node = node["height"]
+        ax.plot([x_left, x_node], [y_left, y_left], color="0.35", linewidth=1.0)
+        ax.plot([x_right, x_node], [y_right, y_right], color="0.35", linewidth=1.0)
+        ax.plot([x_node, x_node], [y_left, y_right], color="0.35", linewidth=1.0)
+        draw_left(left, ax)
+        draw_left(right, ax)
+
+    max_height = max(float(cluster_root["height"]), 0.001)
+
+    ax_top = fig.add_subplot(gs[1, 2])
+    draw_top(cluster_root, ax_top)
+    ax_top.set_xlim(-0.5, n - 0.5)
+    ax_top.set_ylim(0, max_height * 1.05)
+    ax_top.set_xticks([])
+    ax_top.set_yticks([])
+    for spine in ax_top.spines.values():
+        spine.set_visible(False)
+
+    ax_top_colors = fig.add_subplot(gs[2, 2])
+    colors = identity_country_colors()
+    for pos, label in enumerate(clustered_labels):
+        country = infer_identity_label_country(label)
+        ax_top_colors.add_patch(Rectangle((pos - 0.5, -0.5), 1.0, 1.0, color=colors.get(country, colors["Other"])))
+    ax_top_colors.set_xlim(-0.5, n - 0.5)
+    ax_top_colors.set_ylim(-0.5, 0.5)
+    ax_top_colors.set_xticks([])
+    ax_top_colors.set_yticks([])
+    for spine in ax_top_colors.spines.values():
+        spine.set_visible(False)
+
+    ax_left = fig.add_subplot(gs[3, 0])
+    draw_left(cluster_root, ax_left)
+    ax_left.set_xlim(max_height * 1.05, 0)
+    ax_left.set_ylim(n - 0.5, -0.5)
+    ax_left.set_xticks([])
+    ax_left.set_yticks([])
+    for spine in ax_left.spines.values():
+        spine.set_visible(False)
+
+    ax_left_colors = fig.add_subplot(gs[3, 1])
+    for pos, label in enumerate(clustered_labels):
+        country = infer_identity_label_country(label)
+        ax_left_colors.add_patch(Rectangle((-0.5, pos - 0.5), 1.0, 1.0, color=colors.get(country, colors["Other"])))
+    ax_left_colors.set_xlim(-0.5, 0.5)
+    ax_left_colors.set_ylim(n - 0.5, -0.5)
+    ax_left_colors.set_xticks([])
+    ax_left_colors.set_yticks([])
+    for spine in ax_left_colors.spines.values():
+        spine.set_visible(False)
+
+    ax = fig.add_subplot(gs[3, 2])
+    im = ax.imshow(clustered_matrix, cmap="viridis", vmin=vmin, vmax=100.0, interpolation="nearest", aspect="auto")
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    label_fontsize = 8.5 if n > 100 else 10.0
+    display_labels = [clean_tree_display_label(label) for label in clustered_labels]
+    ax.set_xticklabels(display_labels, rotation=90, fontsize=max(7.5, label_fontsize - 1.0))
+    ax.set_yticklabels(display_labels, fontsize=label_fontsize)
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    ax.tick_params(axis="y", labelleft=False, labelright=True, pad=6)
+    ax.set_xticks([x - 0.5 for x in range(1, n)], minor=True)
+    ax.set_yticks([y - 0.5 for y in range(1, n)], minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=0.6)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    cax = ax_legend.inset_axes([0.00, 0.28, 0.22, 0.22])
+    cbar = fig.colorbar(im, cax=cax, orientation="horizontal")
+    cbar.set_label("Genome identity (%)", fontsize=11, fontweight="bold", labelpad=4)
+    cbar.ax.tick_params(labelsize=9, length=0)
+
+    countries = []
+    for label in clustered_labels:
+        country = infer_identity_label_country(label)
+        if country not in countries:
+            countries.append(country)
+    x = 0.30
+    y = 0.43
+    for country in countries:
+        ax_legend.add_patch(Rectangle((x, y - 0.06), 0.018, 0.12, transform=ax_legend.transAxes,
+                                      color=colors.get(country, colors["Other"]), clip_on=False))
+        ax_legend.text(x + 0.026, y, country, transform=ax_legend.transAxes,
+                       va="center", ha="left", fontsize=10.5)
+        x += 0.12 if country != "South Korea" else 0.16
+    fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
+    fig.savefig(str(png_path), format="png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def step11_identity_plot(shared_layout: Dict[str, Path], plot_min: float | None) -> None:
     from Bio import Phylo
 
     log_file = shared_layout["logs"] / "step11_identity_heatmap.log"
     trimmed_alignment = step10_outputs(shared_layout)[0]
-    matrix_tsv, pdf, png, assembled_matrix_tsv, assembled_pdf, assembled_png = step11_identity_outputs(shared_layout)
+    (
+        matrix_tsv,
+        pdf,
+        png,
+        clustered_pdf,
+        clustered_png,
+        assembled_matrix_tsv,
+        assembled_pdf,
+        assembled_png,
+        assembled_clustered_pdf,
+        assembled_clustered_png,
+    ) = step11_identity_outputs(shared_layout)
     treefile = step12_tree_outputs(shared_layout)[0]
     records = load_alignment_records(trimmed_alignment)
     if not records:
@@ -3307,19 +3626,42 @@ def step11_identity_plot(shared_layout: Dict[str, Path], plot_min: float | None)
         labels, matrix = reorder_matrix(labels, matrix, tree_order)
 
     write_identity_matrix(matrix_tsv, labels, matrix)
-    render_identity_heatmap(labels, matrix, pdf, png, "CYVCV genome identity heatmap", plot_min)
+    render_clustered_identity_heatmap(
+        labels,
+        matrix,
+        pdf,
+        png,
+        "CYVCV genome identity heatmap with similarity clustering",
+        plot_min,
+    )
+    render_clustered_identity_heatmap(
+        labels,
+        matrix,
+        clustered_pdf,
+        clustered_png,
+        "CYVCV genome identity heatmap with similarity clustering",
+        plot_min,
+    )
 
     assembled_labels = [label for label in labels if is_assembled_tip(label)]
     if not assembled_labels:
         raise RuntimeError("No assembled isolates were found for the assembled-only identity heatmap")
     assembled_labels, assembled_matrix = subset_matrix(labels, matrix, assembled_labels)
     write_identity_matrix(assembled_matrix_tsv, assembled_labels, assembled_matrix)
-    render_identity_heatmap(
+    render_clustered_identity_heatmap(
         assembled_labels,
         assembled_matrix,
         assembled_pdf,
         assembled_png,
-        "Assembled isolate identity heatmap",
+        "Assembled isolate identity heatmap with similarity clustering",
+        plot_min,
+    )
+    render_clustered_identity_heatmap(
+        assembled_labels,
+        assembled_matrix,
+        assembled_clustered_pdf,
+        assembled_clustered_png,
+        "Assembled isolate identity heatmap with similarity clustering",
         plot_min,
     )
 
@@ -3327,29 +3669,84 @@ def step11_identity_plot(shared_layout: Dict[str, Path], plot_min: float | None)
         logh.write(f"[{now()}] Pairwise identity matrix written to: {matrix_tsv}\n")
         logh.write(f"[{now()}] Heatmap PDF written to: {pdf}\n")
         logh.write(f"[{now()}] Heatmap PNG written to: {png}\n")
+        logh.write(f"[{now()}] Clustered heatmap PDF written to: {clustered_pdf}\n")
+        logh.write(f"[{now()}] Clustered heatmap PNG written to: {clustered_png}\n")
         logh.write(f"[{now()}] Assembled-only identity matrix written to: {assembled_matrix_tsv}\n")
         logh.write(f"[{now()}] Assembled-only heatmap PDF written to: {assembled_pdf}\n")
         logh.write(f"[{now()}] Assembled-only heatmap PNG written to: {assembled_png}\n")
+        logh.write(f"[{now()}] Assembled-only clustered heatmap PDF written to: {assembled_clustered_pdf}\n")
+        logh.write(f"[{now()}] Assembled-only clustered heatmap PNG written to: {assembled_clustered_png}\n")
 
 
 # ---------------------------------------------------------------------
 # Step 12 - IQ-TREE + PDF
 # ---------------------------------------------------------------------
 
-def step12_tree_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path]:
+def step12_tree_outputs(shared_layout: Dict[str, Path]) -> Tuple[Path, Path, Path, Path]:
     treefile = shared_layout["tree"] / "alignment_mafft.trimmed.treefile"
     iqtree = shared_layout["tree"] / "alignment_mafft.trimmed.iqtree"
     pdf = shared_layout["tree"] / "alignment_mafft.trimmed.tree.pdf"
-    return treefile, iqtree, pdf
+    svg = shared_layout["tree"] / "alignment_mafft.trimmed.tree.geographic_origin.svg"
+    return treefile, iqtree, pdf, svg
 
 
 def step12_tree_done(shared_layout: Dict[str, Path]) -> bool:
-    treefile, iqtree, pdf = step12_tree_outputs(shared_layout)
-    return treefile.exists() and iqtree.exists() and pdf.exists()
+    treefile, iqtree, pdf, svg = step12_tree_outputs(shared_layout)
+    return treefile.exists() and iqtree.exists() and pdf.exists() and svg.exists()
 
 
 def is_assembled_tip(label: str) -> bool:
     return "__" in label
+
+
+def clean_tree_display_label(label: str) -> str:
+    return re.sub(r"(?:__|_)contig_\d+$", "", label)
+
+
+def tree_label_country(label: str) -> str:
+    return infer_identity_label_country(label)
+
+
+def label_accession(label: str) -> str:
+    return clean_tree_display_label(label).split("/")[0].split()[0]
+
+
+def country_from_geo_location(value: str) -> str:
+    text = (value or "").strip().replace("_", " ")
+    if not text:
+        return ""
+    return text.split(":", 1)[0].strip()
+
+
+def load_reference_country_map(metadata_tsv: Path | None) -> Dict[str, str]:
+    if metadata_tsv is None or not metadata_tsv.exists():
+        return {}
+    countries: Dict[str, str] = {}
+    with open(metadata_tsv, "r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            acc = (row.get("Accession") or "").strip()
+            country = country_from_geo_location(row.get("Geographic Location") or "")
+            if acc and country:
+                countries[acc] = country
+    return countries
+
+
+def tree_label_country_from_map(label: str, reference_countries: Dict[str, str]) -> str:
+    acc = label_accession(label)
+    if acc in reference_countries:
+        return reference_countries[acc]
+    return tree_label_country(label)
+
+
+def bootstrap_display_label(label: str) -> str:
+    clean = label.strip()
+    if "/" in clean:
+        clean = clean.split("/")[-1].strip()
+    try:
+        return str(round(float(clean)))
+    except ValueError:
+        return clean
 
 
 def is_bootstrap_label(label: str) -> bool:
@@ -3365,7 +3762,39 @@ def is_bootstrap_label(label: str) -> bool:
     return 0.0 <= value <= 100.0
 
 
-def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
+def formatted_node_support(clade, min_support: float = 75.0) -> str | None:
+    if clade.is_terminal():
+        return None
+    label = clade_support_label(clade)
+    if not label:
+        return None
+    try:
+        value = float(label)
+    except ValueError:
+        return label
+    if value < min_support:
+        return None
+    return str(round(value))
+
+
+def prepare_tree_for_display(tree, render_mode: str):
+    if render_mode == "phylogram":
+        return tree
+    display_tree = copy.deepcopy(tree)
+    for clade in display_tree.find_clades():
+        if clade is not display_tree.root:
+            clade.branch_length = 1.0
+    depths = display_tree.depths()
+    max_terminal_depth = max(depths[term] for term in display_tree.get_terminals())
+    for term in display_tree.get_terminals():
+        missing = max_terminal_depth - depths[term]
+        if missing > 0:
+            term.branch_length = (term.branch_length or 0.0) + missing
+    return display_tree
+
+
+def render_tree_pdf(treefile: Path, pdf_path: Path, metadata_tsv: Path | None = None,
+                    render_mode: str = "phylogram") -> None:
     from Bio import Phylo
     import matplotlib
 
@@ -3374,26 +3803,38 @@ def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
     from matplotlib.lines import Line2D
 
     tree = Phylo.read(str(treefile), "newick")
-    terminals = max(1, len(tree.get_terminals()))
-    fig_width = max(14, min(42, terminals * 0.45))
-    fig_height = max(9, min(52, terminals * 0.55))
-    tip_font_size = max(7.5, min(10.5, 13.0 - terminals * 0.055))
-    sample_font_size = min(12.0, tip_font_size + 1.3)
-    bootstrap_font_size = max(8.0, min(11.0, tip_font_size + 1.0))
+    tree.ladderize(reverse=True)
+    display_tree = prepare_tree_for_display(tree, render_mode)
+    reference_countries = load_reference_country_map(metadata_tsv)
+    terminals = max(1, len(display_tree.get_terminals()))
+    fig_width = max(26, min(96, terminals * 0.70 if render_mode == "cladogram" else terminals * 0.95))
+    fig_height = max(24, min(210, terminals * 1.48))
+    tip_font_size = max(17.8, min(19.6, 22.5 - terminals * 0.02))
+    sample_font_size = min(22.8, tip_font_size + 2.2)
+    bootstrap_font_size = max(14.0, min(16.2, tip_font_size - 1.4))
 
     fig = plt.figure(figsize=(fig_width, fig_height))
     ax = fig.add_subplot(1, 1, 1)
-    Phylo.draw(tree, axes=ax, do_show=False)
+    Phylo.draw(
+        display_tree,
+        axes=ax,
+        do_show=False,
+        label_func=lambda clade: clade.name if clade.is_terminal() else None,
+        branch_labels=lambda clade: formatted_node_support(clade, 75.0),
+    )
+    xmin, xmax = ax.get_xlim()
+    xspan = xmax - xmin if xmax > xmin else 1.0
+    ax.set_xlim(xmin, xmax + xspan * (0.22 if render_mode == "cladogram" else 0.16))
 
     for line in ax.get_lines():
         line.set_color("#4d5656")
-        line.set_linewidth(0.9)
-        line.set_alpha(0.92)
+        line.set_linewidth(1.25 if render_mode == "cladogram" else 0.9)
+        line.set_alpha(0.95)
     for collection in ax.collections:
         try:
             collection.set_color("#4d5656")
-            collection.set_linewidth(0.9)
-            collection.set_alpha(0.92)
+            collection.set_linewidth(1.25 if render_mode == "cladogram" else 0.9)
+            collection.set_alpha(0.95)
         except Exception:
             pass
 
@@ -3402,56 +3843,356 @@ def render_tree_pdf(treefile: Path, pdf_path: Path) -> None:
         if not label:
             continue
         if is_assembled_tip(label):
-            text.set_color("#c0392b")
+            text.set_text(clean_tree_display_label(label))
+            country = tree_label_country_from_map(label, reference_countries)
+            text.set_color(identity_country_colors().get(country, identity_country_colors()["Other"]))
             text.set_fontweight("bold")
             text.set_fontsize(sample_font_size)
+            text.set_clip_on(False)
             text.set_zorder(5)
         elif is_bootstrap_label(label):
+            text.set_text(bootstrap_display_label(label))
             text.set_color("#17202a")
             text.set_fontweight("bold")
             text.set_fontsize(bootstrap_font_size)
             text.set_zorder(6)
             text.set_bbox({"facecolor": "white", "edgecolor": "none", "alpha": 0.78, "pad": 0.35})
         else:
-            text.set_color("#283747")
+            country = tree_label_country_from_map(label, reference_countries)
+            text.set_color(identity_country_colors().get(country, identity_country_colors()["Other"]))
             text.set_fontsize(tip_font_size)
             text.set_fontweight("normal")
+            text.set_clip_on(False)
 
+    countries = []
+    for term in display_tree.get_terminals():
+        country = tree_label_country_from_map(term.name, reference_countries)
+        if country not in countries:
+            countries.append(country)
+    colors = identity_country_colors()
     legend_handles = [
-        Line2D([0], [0], color="#c0392b", lw=0, marker="o", markersize=7, label="Samples analyzed"),
-        Line2D([0], [0], color="#283747", lw=0, marker="o", markersize=7, label="Reference genomes"),
-        Line2D([0], [0], color="#17202a", lw=0, marker="$99$", markersize=10, label="Bootstrap support"),
+        Line2D([0], [0], color=colors.get(country, colors["Other"]), lw=0, marker="o", markersize=9, label=country)
+        for country in countries
     ]
-    ax.legend(handles=legend_handles, loc="upper right", frameon=False, fontsize=max(9, tip_font_size))
-    ax.set_title("Maximum-likelihood phylogeny", fontsize=14, fontweight="bold", pad=12)
+    ax.legend(
+        handles=legend_handles,
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        frameon=False,
+        fontsize=max(19, tip_font_size + 2.4),
+        handletextpad=0.8,
+        labelspacing=0.65,
+        markerscale=1.2,
+    )
+    ax.set_title("Maximum-likelihood phylogeny", fontsize=max(22, tip_font_size + 5), fontweight="bold", pad=18)
+    ax.set_ylabel("")
+    ax.set_yticks([])
+    ax.spines["left"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["top"].set_visible(False)
+    if render_mode == "cladogram":
+        ax.set_xlabel("")
+        ax.set_xticks([])
+        ax.spines["bottom"].set_visible(False)
 
     fig.tight_layout()
     fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
     plt.close(fig)
 
 
+def svg_escape(value: object) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
-def step12_iqtree(shared_layout: Dict[str, Path], threads: int) -> None:
+
+def clade_support_label(clade) -> str:
+    raw = ""
+    if getattr(clade, "name", None):
+        raw = str(clade.name)
+    elif getattr(clade, "confidence", None) is not None:
+        raw = str(clade.confidence)
+    return bootstrap_display_label(raw) if raw else ""
+
+
+def render_tree_publication_svg(treefile: Path, svg_path: Path, metadata_tsv: Path | None = None) -> None:
+    from Bio import Phylo
+
+    tree = Phylo.read(str(treefile), "newick")
+    tree.ladderize(reverse=True)
+    reference_countries = load_reference_country_map(metadata_tsv)
+    colors = identity_country_colors()
+    terminals = tree.get_terminals()
+    if not terminals:
+        raise RuntimeError("Cannot render SVG tree: no terminal nodes found")
+
+    depths = tree.depths()
+    max_depth = max((depths.get(tip, 0.0) for tip in terminals), default=0.0)
+    if max_depth <= 0:
+        for clade in tree.find_clades():
+            if clade is not tree.root and not clade.branch_length:
+                clade.branch_length = 1.0
+        depths = tree.depths()
+        max_depth = max((depths.get(tip, 0.0) for tip in terminals), default=1.0)
+
+    y_step = 32.0
+    margin_top = 162.0
+    margin_left = 105.0
+    margin_bottom = 105.0
+    tree_width = 920.0
+    labels_x = margin_left + tree_width + 42.0
+    tip_font = 19.0
+    bootstrap_font = 14.0
+
+    y_cursor = margin_top
+
+    def assign_y(clade):
+        nonlocal y_cursor
+        if clade.is_terminal():
+            clade._svg_y = y_cursor
+            y_cursor += y_step
+            return clade._svg_y
+        child_ys = [assign_y(child) for child in clade.clades]
+        clade._svg_y = sum(child_ys) / len(child_ys) if child_ys else y_cursor
+        return clade._svg_y
+
+    assign_y(tree.root)
+    for clade in tree.find_clades(order="preorder"):
+        clade._svg_x = margin_left + (depths.get(clade, 0.0) / max_depth) * tree_width
+
+    cleaned_labels = [clean_tree_display_label(tip.name or "") for tip in terminals]
+    max_label_chars = max((len(label) for label in cleaned_labels), default=60)
+    label_width = max(1020.0, min(1660.0, max_label_chars * 10.0))
+    width = int(labels_x + label_width + 135.0)
+    height = int(margin_top + y_step * len(terminals) + margin_bottom)
+
+    parts: List[str] = []
+    parts.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">')
+    parts.append('<rect width="100%" height="100%" fill="white"/>')
+    parts.append(f'<text x="{width / 2:.1f}" y="42" text-anchor="middle" font-family="Arial, sans-serif" font-size="34" font-weight="700">Maximum-likelihood phylogeny</text>')
+    parts.append(f'<text x="{width / 2:.1f}" y="78" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" fill="#555">Tip colours indicate geographic origin</text>')
+
+    legend_x = margin_left
+    legend_y = 122.0
+    legend_order = [
+        country for country in ["Spain", "Italy", "Turkey", "China", "USA", "South Korea", "India", "Pakistan"]
+        if any(tree_label_country_from_map(tip.name or "", reference_countries) == country for tip in terminals)
+    ]
+    for country in legend_order:
+        parts.append(f'<circle cx="{legend_x:.1f}" cy="{legend_y:.1f}" r="9.5" fill="{colors.get(country, colors["Other"])}"/>')
+        parts.append(f'<text x="{legend_x + 21:.1f}" y="{legend_y + 7.0:.1f}" font-family="Arial, sans-serif" font-size="21">{svg_escape(country)}</text>')
+        legend_x += 205.0 if country == "South Korea" else 146.0
+
+    def draw_branches(clade):
+        if not clade.clades:
+            return
+        child_ys = [child._svg_y for child in clade.clades]
+        parts.append(f'<line x1="{clade._svg_x:.3f}" y1="{min(child_ys):.3f}" x2="{clade._svg_x:.3f}" y2="{max(child_ys):.3f}" stroke="#333" stroke-width="1.05"/>')
+        for child in clade.clades:
+            parts.append(f'<line x1="{clade._svg_x:.3f}" y1="{child._svg_y:.3f}" x2="{child._svg_x:.3f}" y2="{child._svg_y:.3f}" stroke="#333" stroke-width="1.05"/>')
+            support = "" if child.is_terminal() else clade_support_label(child)
+            if support:
+                try:
+                    show_support = float(support) >= 75
+                except ValueError:
+                    show_support = True
+                if show_support:
+                    text_x = max(clade._svg_x + 4.0, child._svg_x - 6.0)
+                    parts.append(f'<text x="{text_x:.3f}" y="{child._svg_y - 4:.3f}" text-anchor="end" font-family="Arial, sans-serif" font-size="{bootstrap_font}" font-weight="600" fill="#555">{svg_escape(support)}</text>')
+            draw_branches(child)
+
+    draw_branches(tree.root)
+
+    for tip in terminals:
+        label = tip.name or ""
+        display_label = clean_tree_display_label(label)
+        country = tree_label_country_from_map(label, reference_countries)
+        color = colors.get(country, colors["Other"])
+        weight = "700" if is_assembled_tip(label) else "400"
+        parts.append(f'<circle cx="{tip._svg_x:.3f}" cy="{tip._svg_y:.3f}" r="4.2" fill="{color}" stroke="white" stroke-width="0.8"/>')
+        parts.append(f'<text x="{labels_x:.3f}" y="{tip._svg_y + 4:.3f}" font-family="Arial, sans-serif" font-size="{tip_font}" font-weight="{weight}" fill="{color}">{svg_escape(display_label)}</text>')
+
+    scale_y = height - 46
+    scale_pixels = (0.01 / max_depth) * tree_width if max_depth > 0 else 0
+    if scale_pixels > 1:
+        scale_x0 = margin_left
+        parts.append(f'<line x1="{scale_x0:.1f}" y1="{scale_y}" x2="{scale_x0 + scale_pixels:.1f}" y2="{scale_y}" stroke="#222" stroke-width="1.4"/>')
+        parts.append(f'<line x1="{scale_x0:.1f}" y1="{scale_y - 4}" x2="{scale_x0:.1f}" y2="{scale_y + 4}" stroke="#222" stroke-width="1.4"/>')
+        parts.append(f'<line x1="{scale_x0 + scale_pixels:.1f}" y1="{scale_y - 4}" x2="{scale_x0 + scale_pixels:.1f}" y2="{scale_y + 4}" stroke="#222" stroke-width="1.4"/>')
+        parts.append(f'<text x="{scale_x0 + scale_pixels / 2:.1f}" y="{scale_y + 22}" text-anchor="middle" font-family="Arial, sans-serif" font-size="12">0.01 substitutions/site</text>')
+
+    parts.append("</svg>")
+    svg_path.write_text("\n".join(parts), encoding="utf-8")
+
+
+
+def step12_iqtree(shared_layout: Dict[str, Path], threads: int, tree_render_mode: str = "phylogram") -> None:
     log_file = shared_layout["logs"] / "step12_iqtree.log"
     aln = step10_outputs(shared_layout)[0]
     prefix = shared_layout["tree"] / "alignment_mafft.trimmed"
 
+    treefile, iqtree_txt, pdf, svg = step12_tree_outputs(shared_layout)
+    if not treefile.exists() or not iqtree_txt.exists():
+        run_logged(
+            [
+                "iqtree",
+                "-s", str(aln),
+                "-m", "MFP",
+                "-bb", "1000",
+                "-nt", "AUTO",
+                "--prefix", str(prefix),
+            ],
+            log_file
+        )
+
+    if not treefile.exists() or not iqtree_txt.exists():
+        raise RuntimeError("IQ-TREE output not found")
+    render_tree_pdf(treefile, pdf, step2_outputs(shared_layout)[1], tree_render_mode)
+    render_tree_publication_svg(treefile, svg, step2_outputs(shared_layout)[1])
+
+
+# ---------------------------------------------------------------------
+# Optional assembled contigs + reference phylogeny
+# ---------------------------------------------------------------------
+
+def assembled_reference_tree_outputs(shared_layout: Dict[str, Path]) -> Dict[str, Path]:
+    outdir = shared_layout["assembled_ref_tree"]
+    prefix = outdir / "assembled_plus_reference"
+    return {
+        "outdir": outdir,
+        "dataset": outdir / "assembled_plus_reference.fasta",
+        "alignment": outdir / "assembled_plus_reference.mafft.fasta",
+        "trimal_raw": outdir / "assembled_plus_reference.trimal_raw.fasta",
+        "core_raw": outdir / "assembled_plus_reference.core_raw.fasta",
+        "trimmed": outdir / "assembled_plus_reference.trimmed.fasta",
+        "html": outdir / "assembled_plus_reference.trimmed.html",
+        "prefix": prefix,
+        "treefile": outdir / "assembled_plus_reference.treefile",
+        "iqtree": outdir / "assembled_plus_reference.iqtree",
+        "pdf": outdir / "assembled_plus_reference.tree.pdf",
+        "summary": outdir / "assembled_plus_reference_summary.txt",
+    }
+
+
+def assembled_reference_tree_done(shared_layout: Dict[str, Path]) -> bool:
+    outputs = assembled_reference_tree_outputs(shared_layout)
+    return (
+        outputs["treefile"].exists()
+        and outputs["iqtree"].exists()
+        and outputs["pdf"].exists()
+        and outputs["summary"].exists()
+    )
+
+
+def select_reference_record(reference_fasta: Path, reference_id: str):
+    records = list(SeqIO.parse(str(reference_fasta), "fasta"))
+    if not records:
+        raise RuntimeError("No complete reference genomes are available for assembled-reference tree")
+
+    if reference_id.lower() == "auto":
+        for rec in records:
+            if rec.id.split("/")[0].startswith("NC_"):
+                return rec, "auto_refseq_nc_accession"
+        return records[0], "auto_first_complete_reference"
+
+    for rec in records:
+        accession = rec.id.split("/")[0]
+        if rec.id == reference_id or accession == reference_id or rec.id.startswith(reference_id):
+            return rec, "user_requested_reference"
+    raise RuntimeError(f"Reference accession not found in renamed references: {reference_id}")
+
+
+def write_assembled_reference_dataset(shared_layout: Dict[str, Path], reference_id: str, out_fasta: Path) -> Tuple[int, str, str]:
+    renamed_refs = step2_outputs(shared_layout)[2]
+    oriented_contigs = step9_outputs(shared_layout)[2]
+    if not oriented_contigs.exists() or oriented_contigs.stat().st_size == 0:
+        raise RuntimeError("Oriented target contigs not found; run the global MAFFT step first")
+
+    reference, reference_selection = select_reference_record(renamed_refs, reference_id)
+    assembled_records = list(SeqIO.parse(str(oriented_contigs), "fasta"))
+    if not assembled_records:
+        raise RuntimeError("No assembled target contigs found for assembled-reference tree")
+
+    SeqIO.write([reference, *assembled_records], str(out_fasta), "fasta")
+    return len(assembled_records), reference.id, reference_selection
+
+
+def step12b_assembled_reference_tree(shared_layout: Dict[str, Path], threads: int, reference_id: str,
+                                     gap_threshold: float, min_occupancy: float,
+                                     min_assembled_core_occupancy: float,
+                                     tree_render_mode: str = "phylogram") -> None:
+    outputs = assembled_reference_tree_outputs(shared_layout)
+    mkdir(outputs["outdir"])
+    log_file = shared_layout["logs"] / "step12b_assembled_reference_tree.log"
+
+    n_assembled, reference_label, reference_selection = write_assembled_reference_dataset(
+        shared_layout, reference_id, outputs["dataset"]
+    )
+
+    cmd_mafft = [
+        "mafft",
+        "--thread", str(threads),
+        "--auto",
+        str(outputs["dataset"]),
+    ]
+    with open(outputs["alignment"], "w", encoding="utf-8") as out, open(log_file, "a", encoding="utf-8") as logh:
+        logh.write(f"\n[{now()}] CMD: {' '.join(cmd_mafft)}\n")
+        proc = subprocess.run(cmd_mafft, stdout=out, stderr=logh, text=True, check=False, env=external_tool_env())
+        if proc.returncode != 0:
+            raise RuntimeError("MAFFT assembled-reference alignment failed")
+
+    run_logged(
+        [
+            "trimal",
+            "-in", str(outputs["alignment"]),
+            "-out", str(outputs["trimal_raw"]),
+            "-htmlout", str(outputs["html"]),
+            "-gt", str(gap_threshold),
+        ],
+        log_file
+    )
+    trimal_cols, core_start, core_end = extract_assembled_core_block(
+        outputs["trimal_raw"], outputs["core_raw"], min_assembled_core_occupancy
+    )
+    _, kept_cols = filter_alignment_by_occupancy(outputs["core_raw"], outputs["trimmed"], min_occupancy)
+
     run_logged(
         [
             "iqtree",
-            "-s", str(aln),
+            "-s", str(outputs["trimmed"]),
             "-m", "MFP",
             "-bb", "1000",
+            "-alrt", "1000",
+            "-bnni",
             "-nt", "AUTO",
-            "--prefix", str(prefix),
+            "--prefix", str(outputs["prefix"]),
         ],
         log_file
     )
 
-    treefile, iqtree_txt, pdf = step12_tree_outputs(shared_layout)
-    if not treefile.exists() or not iqtree_txt.exists():
-        raise RuntimeError("IQ-TREE output not found")
-    render_tree_pdf(treefile, pdf)
+    if not outputs["treefile"].exists() or not outputs["iqtree"].exists():
+        raise RuntimeError("Assembled-reference IQ-TREE output not found")
+    render_tree_pdf(outputs["treefile"], outputs["pdf"], step2_outputs(shared_layout)[1], tree_render_mode)
+
+    with open(outputs["summary"], "w", encoding="utf-8") as fh:
+        fh.write("Assembled contigs plus reference ML tree\n")
+        fh.write(f"Date: {now()}\n\n")
+        fh.write(f"Reference requested: {reference_id}\n")
+        fh.write(f"Reference used: {reference_label}\n")
+        fh.write(f"Reference selection mode: {reference_selection}\n")
+        fh.write(f"Assembled contigs included: {n_assembled}\n")
+        fh.write(f"Alignment after trimAl: {trimal_cols} columns\n")
+        fh.write(f"Assembled-contig core block: {core_start}-{core_end}\n")
+        fh.write(f"Final trimmed alignment: {kept_cols} columns\n")
+        fh.write("IQ-TREE command: -m MFP -bb 1000 -alrt 1000 -bnni -nt AUTO\n\n")
+        fh.write(f"Dataset: {outputs['dataset']}\n")
+        fh.write(f"Trimmed alignment: {outputs['trimmed']}\n")
+        fh.write(f"Treefile: {outputs['treefile']}\n")
+        fh.write(f"Tree PDF: {outputs['pdf']}\n")
 
 
 # ---------------------------------------------------------------------
@@ -3487,8 +4228,19 @@ def sample_summary_row(sample_layout: Dict[str, Path], shared_layout: Dict[str, 
     target_contigs = step8_outputs(sample_layout)[0]
     preselect_stats = step5_outputs(sample_layout)[1]
     trimmed_alignment, _ = step10_outputs(shared_layout)
-    identity_tsv, identity_pdf, _, assembled_identity_tsv, assembled_identity_pdf, _ = step11_identity_outputs(shared_layout)
-    treefile, _, tree_pdf = step12_tree_outputs(shared_layout)
+    (
+        identity_tsv,
+        identity_pdf,
+        _,
+        clustered_identity_pdf,
+        _,
+        assembled_identity_tsv,
+        assembled_identity_pdf,
+        _,
+        assembled_clustered_identity_pdf,
+        _,
+    ) = step11_identity_outputs(shared_layout)
+    treefile, _, tree_pdf, tree_svg = step12_tree_outputs(shared_layout)
 
     reads_in = count_fastq_reads(reads)
     reads_qc = count_fastq_reads(step3_outputs(sample_layout, min_q)[0])
@@ -3520,10 +4272,13 @@ def sample_summary_row(sample_layout: Dict[str, Path], shared_layout: Dict[str, 
         "trimmed_alignment": str(trimmed_alignment),
         "identity_matrix": str(identity_tsv),
         "identity_heatmap": str(identity_pdf),
+        "clustered_identity_heatmap": str(clustered_identity_pdf),
         "assembled_identity_matrix": str(assembled_identity_tsv),
         "assembled_identity_heatmap": str(assembled_identity_pdf),
+        "assembled_clustered_identity_heatmap": str(assembled_clustered_identity_pdf),
         "treefile": str(treefile),
         "tree_pdf": str(tree_pdf),
+        "tree_publication_svg": str(tree_svg),
     }
 
 
@@ -3536,8 +4291,9 @@ def step11_report(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path]
         "sample", "taxid", "reads_input", "reads_after_qc", "reads_for_assembly",
         "assembly_selected_coverage", "n_complete_refs", "n_assembly_contigs",
         "n_target_contigs", "best_hit", "trimmed_alignment", "identity_matrix",
-        "identity_heatmap", "assembled_identity_matrix", "assembled_identity_heatmap",
-        "treefile", "tree_pdf"
+        "identity_heatmap", "clustered_identity_heatmap", "assembled_identity_matrix",
+        "assembled_identity_heatmap", "assembled_clustered_identity_heatmap",
+        "treefile", "tree_pdf", "tree_publication_svg"
     ]
     with open(summary_tsv, "w", encoding="utf-8", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=fields, delimiter="\t")
@@ -3559,16 +4315,19 @@ def step11_report(sample_layout: Dict[str, Path], shared_layout: Dict[str, Path]
     Best BLAST hit: {row['best_hit']}
 
     Main outputs:
-    - Assembly input subset: 03b_reads_for_assembly/reads.assembly_subset.fastq.gz
+    - Assembly input subset: 03_reads_for_assembly/reads.assembly_subset.fastq.gz
     - Target contigs: 06_taxon_filtered_contigs/contigs_target_taxon.fasta
     - Global alignment: {step9_outputs(shared_layout)[4]}
     - Trimmed alignment: {row['trimmed_alignment']}
     - Pairwise identity matrix: {row['identity_matrix']}
     - Global identity heatmap: {row['identity_heatmap']}
+    - Global clustered identity heatmap: {row['clustered_identity_heatmap']}
     - Assembled-only identity matrix: {row['assembled_identity_matrix']}
     - Assembled-only identity heatmap: {row['assembled_identity_heatmap']}
+    - Assembled-only clustered identity heatmap: {row['assembled_clustered_identity_heatmap']}
     - Global tree: {row['treefile']}
     - Global tree PDF: {row['tree_pdf']}
+    - Global tree geographic-origin SVG: {row['tree_publication_svg']}
     """)
     with open(summary_txt, "w", encoding="utf-8") as out:
         out.write(txt)
@@ -3590,6 +4349,10 @@ class Step:
 def validate_shared_inputs(args) -> None:
     if SeqIO is None:
         die("Biopython is not installed. Please install it in your environment before running the pipeline.")
+    if args.threads < 1:
+        die("--threads must be >= 1")
+    if args.sample_parallel < 1:
+        die("--sample-parallel must be >= 1")
     for exe in ["datasets", "dataformat", "unzip", "fastplong", "flye", "makeblastdb", "blastn", "mafft", "trimal", "iqtree"]:
         require_executable(exe)
     if args.run_beast2:
@@ -3653,8 +4416,9 @@ def write_batch_summary(outdir: Path, rows: List[Dict[str, str]]) -> Tuple[Path,
         "sample", "taxid", "reads_input", "reads_after_qc", "reads_for_assembly",
         "assembly_selected_coverage", "n_complete_refs", "n_assembly_contigs",
         "n_target_contigs", "best_hit", "trimmed_alignment", "identity_matrix",
-        "identity_heatmap", "assembled_identity_matrix", "assembled_identity_heatmap",
-        "treefile", "tree_pdf"
+        "identity_heatmap", "clustered_identity_heatmap", "assembled_identity_matrix",
+        "assembled_identity_heatmap", "assembled_clustered_identity_heatmap",
+        "treefile", "tree_pdf", "tree_publication_svg"
     ]
     with open(summary_tsv, "w", encoding="utf-8", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=fields, delimiter="\t")
@@ -3675,10 +4439,13 @@ def write_batch_summary(outdir: Path, rows: List[Dict[str, str]]) -> Tuple[Path,
             f"  Trimmed alignment: {row['trimmed_alignment']}",
             f"  Identity matrix: {row['identity_matrix']}",
             f"  Global identity heatmap: {row['identity_heatmap']}",
+            f"  Global clustered identity heatmap: {row['clustered_identity_heatmap']}",
             f"  Assembled-only identity matrix: {row['assembled_identity_matrix']}",
             f"  Assembled-only identity heatmap: {row['assembled_identity_heatmap']}",
+            f"  Assembled-only clustered identity heatmap: {row['assembled_clustered_identity_heatmap']}",
             f"  Tree: {row['treefile']}",
             f"  Tree PDF: {row['tree_pdf']}",
+            f"  Tree geographic-origin SVG: {row['tree_publication_svg']}",
             "",
         ])
     with open(summary_txt, "w", encoding="utf-8") as out:
@@ -3715,7 +4482,8 @@ def run_global_setup(shared_layout: Dict[str, Path], args) -> None:
 
 
 def run_single_sample_pipeline(args, shared_layout: Dict[str, Path], sample_name: str,
-                               reads: Path, sample_index: int, total_samples: int) -> Dict[str, str]:
+                               reads: Path, sample_index: int, total_samples: int,
+                               quiet: bool = False) -> Dict[str, str]:
     layout = make_sample_layout(shared_layout, sample_name)
 
     steps = [
@@ -3751,30 +4519,35 @@ def run_single_sample_pipeline(args, shared_layout: Dict[str, Path], sample_name
     ]
 
     total = len(steps)
-    print_section(f"Sample {sample_index}/{total_samples}")
-    print_status_line("Sample", sample_name, "magenta")
-    print_status_line("Reads", summarize_path(reads))
-    print_status_line("Output", summarize_path(layout["base"]))
-    print_status_line("Resume mode", "enabled", "green")
-    print_status_line("Tool logs", summarize_path(layout["logs"]))
-    print()
+    if not quiet:
+        print_section(f"Sample {sample_index}/{total_samples}")
+        print_status_line("Sample", sample_name, "magenta")
+        print_status_line("Reads", summarize_path(reads))
+        print_status_line("Output", summarize_path(layout["base"]))
+        print_status_line("Resume mode", "enabled", "green")
+        print_status_line("Tool logs", summarize_path(layout["logs"]))
+        print()
 
     rescue_performed = False
     for idx, step in enumerate(steps, start=1):
         try:
             if step.done_check():
-                draw_progress(idx, total, step.label, "SKIPPED")
+                if not quiet:
+                    draw_progress(idx, total, step.label, "SKIPPED")
                 continue
-            draw_progress(idx - 1 if idx > 1 else 0, total, step.label, "RUNNING")
+            if not quiet:
+                draw_progress(idx - 1 if idx > 1 else 0, total, step.label, "RUNNING")
             step.action()
-            draw_progress(idx, total, step.label, "DONE")
+            if not quiet:
+                draw_progress(idx, total, step.label, "DONE")
         except Exception as exc:
             if step.label == "Assemble with Flye" and args.assembly_retry_all_qc:
-                print()
-                warn(
-                    f"Flye failed for {sample_name} with the preselected reads. "
-                    "Retrying with all QC-passed reads and Flye meta mode."
-                )
+                if not quiet:
+                    print()
+                    warn(
+                        f"Flye failed for {sample_name} with the preselected reads. "
+                        "Retrying with all QC-passed reads and Flye meta mode."
+                    )
                 try:
                     rescued = rescue_sample_with_all_qc_reads(
                         layout,
@@ -3787,46 +4560,112 @@ def run_single_sample_pipeline(args, shared_layout: Dict[str, Path], sample_name
                         args.flye_iterations,
                     )
                 except Exception as rescue_exc:
-                    print()
+                    if not quiet:
+                        print()
                     die(f"Step failed: Rescue assembly with all QC reads\nReason: {rescue_exc}")
-                draw_progress(total, total, "Rescue assembly with all QC reads", "DONE")
-                print_status_line("Rescue result", "RECOVERED" if rescued else "NO TARGET CONTIGS", "yellow" if rescued else "red")
+                if not quiet:
+                    draw_progress(total, total, "Rescue assembly with all QC reads", "DONE")
+                    print_status_line("Rescue result", "RECOVERED" if rescued else "NO TARGET CONTIGS", "yellow" if rescued else "red")
                 rescue_performed = True
                 break
-            print()
+            if not quiet:
+                print()
             die(f"Step failed: {step.label}\nReason: {exc}")
 
     target_count = count_fasta_records(step8_outputs(layout)[0])
     if target_count == 0 and args.assembly_retry_all_qc and not rescue_performed:
-        print()
-        warn(
-            f"No target contigs were retained for {sample_name}. "
-            "Retrying assembly with all QC-passed reads and Flye meta mode."
-        )
-        try:
-            rescued = rescue_sample_with_all_qc_reads(
-                layout,
-                shared_layout,
-                sample_name,
-                args.min_q,
-                args.threads,
-                args.min_pident,
-                args.min_qcov,
-                args.flye_iterations,
+        if rescue_previously_attempted(layout):
+            if not quiet:
+                print()
+                warn(
+                    f"No target contigs were retained for {sample_name}. "
+                    "A previous all-QC-read rescue attempt is already recorded, so rescue assembly is skipped."
+                )
+                print_status_line("Rescue result", "PREVIOUSLY ATTEMPTED - NO TARGET CONTIGS", "yellow")
+        else:
+            if not quiet:
+                print()
+                warn(
+                    f"No target contigs were retained for {sample_name}. "
+                    "Retrying assembly with all QC-passed reads and Flye meta mode."
+                )
+            try:
+                rescued = rescue_sample_with_all_qc_reads(
+                    layout,
+                    shared_layout,
+                    sample_name,
+                    args.min_q,
+                    args.threads,
+                    args.min_pident,
+                    args.min_qcov,
+                    args.flye_iterations,
             )
-        except Exception as exc:
-            print()
-            die(f"Step failed: Rescue assembly with all QC reads\nReason: {exc}")
-        status = "DONE" if rescued else "DONE"
-        detail = "RECOVERED" if rescued else "NO TARGET CONTIGS"
-        draw_progress(total, total, "Rescue assembly with all QC reads", status)
-        print_status_line("Rescue result", detail, "yellow" if rescued else "red")
+            except Exception as exc:
+                if not quiet:
+                    print()
+                die(f"Step failed: Rescue assembly with all QC reads\nReason: {exc}")
+            status = "DONE" if rescued else "DONE"
+            detail = "RECOVERED" if rescued else "NO TARGET CONTIGS"
+            if not quiet:
+                draw_progress(total, total, "Rescue assembly with all QC reads", status)
+                print_status_line("Rescue result", detail, "yellow" if rescued else "red")
 
-    print()
-    print_status_line("Sample finished", sample_name, "green")
-    print_status_line("Target contigs", summarize_path(step8_outputs(layout)[0]), "green")
-    print_status_line("Logs", summarize_path(layout["logs"]))
+    if not quiet:
+        print()
+        print_status_line("Sample finished", sample_name, "green")
+        print_status_line("Target contigs", summarize_path(step8_outputs(layout)[0]), "green")
+        print_status_line("Logs", summarize_path(layout["logs"]))
     return {"sample": sample_name}
+
+
+def run_sample_pipelines(args, shared_layout: Dict[str, Path], sample_jobs: List[SimpleNamespace]) -> List[Dict[str, Path]]:
+    total = len(sample_jobs)
+    sample_layouts: List[Dict[str, Path] | None] = [None] * total
+
+    if args.sample_parallel == 1 or total <= 1:
+        for idx, job in enumerate(sample_jobs, start=1):
+            run_single_sample_pipeline(args, shared_layout, job.sample_name, job.reads, idx, total)
+            sample_layouts[idx - 1] = make_sample_layout(shared_layout, job.sample_name)
+        return [layout for layout in sample_layouts if layout is not None]
+
+    workers = min(args.sample_parallel, total)
+    print_section("Sample processing")
+    print_status_line("Sample parallelism", f"{workers} concurrent sample(s)", "green")
+    print_status_line("Threads per sample", str(args.threads))
+    print_status_line("Progress detail", "per-sample tool logs in 03_samples/<sample>/00_logs/", "blue")
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        for idx, job in enumerate(sample_jobs, start=1):
+            future = executor.submit(
+                run_single_sample_pipeline,
+                args,
+                shared_layout,
+                job.sample_name,
+                job.reads,
+                idx,
+                total,
+                True,
+            )
+            futures[future] = (idx, job)
+
+        completed = 0
+        for future in as_completed(futures):
+            idx, job = futures[future]
+            try:
+                future.result()
+            except BaseException as exc:
+                print()
+                die(f"Sample failed: {job.sample_name}\nReason: {exc}")
+            completed += 1
+            sample_layouts[idx - 1] = make_sample_layout(shared_layout, job.sample_name)
+            print_status_line(
+                f"Sample {completed}/{total} finished",
+                job.sample_name,
+                "green",
+            )
+
+    return [layout for layout in sample_layouts if layout is not None]
 
 
 def run_global_phylogeny(shared_layout: Dict[str, Path], sample_layouts: List[Dict[str, Path]], args) -> None:
@@ -3874,13 +4713,30 @@ def run_global_phylogeny(shared_layout: Dict[str, Path], sample_layouts: List[Di
                  ))
         )
     steps.extend([
-        Step("Infer batch ML tree and render PDF",
+        Step("Infer batch ML tree and render figures",
              lambda: step12_tree_done(shared_layout),
-             lambda: step12_iqtree(shared_layout, args.threads)),
-        Step("Build pairwise identity heatmap",
-             lambda: step11_identity_done(shared_layout),
-             lambda: step11_identity_plot(shared_layout, args.identity_plot_min)),
+             lambda: step12_iqtree(shared_layout, args.threads, args.tree_render_mode)),
     ])
+    if args.assembled_reference_tree:
+        steps.append(
+            Step("Infer assembled-contigs plus reference ML tree",
+                 lambda: assembled_reference_tree_done(shared_layout),
+                 lambda: step12b_assembled_reference_tree(
+                     shared_layout,
+                     args.threads,
+                     args.assembled_reference_id,
+                     args.trimal_gap_threshold,
+                     args.min_alignment_occupancy,
+                     args.min_assembled_core_occupancy,
+                     args.tree_render_mode,
+                 ))
+        )
+    if not args.skip_identity_plot:
+        steps.append(
+            Step("Build pairwise identity heatmap",
+                 lambda: step11_identity_done(shared_layout),
+                 lambda: step11_identity_plot(shared_layout, args.identity_plot_min))
+        )
 
     print_section("Global phylogeny")
     for idx, step in enumerate(steps, start=1):
@@ -3906,16 +4762,14 @@ def run_pipeline(args) -> None:
     print_status_line("TaxID", args.taxid, "magenta")
     print_status_line("Samples detected", str(len(sample_jobs)), "green")
     print_status_line("Threads", str(args.threads))
+    print_status_line("Sample parallelism", str(args.sample_parallel))
     print_status_line("RefSeq virus FASTA", summarize_path(args.refseq_virus_fasta))
     print_status_line("MAFFT strand correction", args.mafft_adjust_direction, "green")
     print_status_line("External tool output", "hidden in 00_logs/", "blue")
 
     run_global_setup(shared_layout, args)
 
-    sample_layouts = []
-    for idx, job in enumerate(sample_jobs, start=1):
-        run_single_sample_pipeline(args, shared_layout, job.sample_name, job.reads, idx, len(sample_jobs))
-        sample_layouts.append(make_sample_layout(shared_layout, job.sample_name))
+    sample_layouts = run_sample_pipelines(args, shared_layout, sample_jobs)
 
     run_global_phylogeny(shared_layout, sample_layouts, args)
 
@@ -3925,8 +4779,19 @@ def run_pipeline(args) -> None:
 
     batch_summary_tsv, batch_summary_txt = write_batch_summary(args.outdir, batch_rows)
     trimmed_alignment, _ = step10_outputs(shared_layout)
-    identity_tsv, identity_pdf, _, assembled_identity_tsv, assembled_identity_pdf, _ = step11_identity_outputs(shared_layout)
-    treefile, _, tree_pdf = step12_tree_outputs(shared_layout)
+    (
+        identity_tsv,
+        identity_pdf,
+        _,
+        clustered_identity_pdf,
+        _,
+        assembled_identity_tsv,
+        assembled_identity_pdf,
+        _,
+        assembled_clustered_identity_pdf,
+        _,
+    ) = step11_identity_outputs(shared_layout)
+    treefile, _, tree_pdf, tree_svg = step12_tree_outputs(shared_layout)
 
     print()
     print_banner("Batch Completed", f"{len(batch_rows)} sample(s) processed successfully")
@@ -3935,10 +4800,18 @@ def run_pipeline(args) -> None:
     print_status_line("Trimmed alignment", summarize_path(trimmed_alignment), "green")
     print_status_line("Identity matrix", summarize_path(identity_tsv), "green")
     print_status_line("Global identity heatmap", summarize_path(identity_pdf), "green")
+    print_status_line("Global clustered identity heatmap", summarize_path(clustered_identity_pdf), "green")
     print_status_line("Assembled-only identity matrix", summarize_path(assembled_identity_tsv), "green")
     print_status_line("Assembled-only heatmap", summarize_path(assembled_identity_pdf), "green")
+    print_status_line("Assembled-only clustered heatmap", summarize_path(assembled_clustered_identity_pdf), "green")
     print_status_line("Global tree", summarize_path(treefile), "green")
     print_status_line("Global tree PDF", summarize_path(tree_pdf), "green")
+    print_status_line("Global tree geographic-origin SVG", summarize_path(tree_svg), "green")
+    if args.assembled_reference_tree:
+        assembled_ref_outputs = assembled_reference_tree_outputs(shared_layout)
+        print_status_line("Assembled + reference tree", summarize_path(assembled_ref_outputs["treefile"]), "green")
+        print_status_line("Assembled + reference tree PDF", summarize_path(assembled_ref_outputs["pdf"]), "green")
+        print_status_line("Assembled + reference summary", summarize_path(assembled_ref_outputs["summary"]), "green")
     if args.prepare_beast2:
         beast2 = beast2_outputs(shared_layout)
         print_status_line("BEAST 2 folder", summarize_path(beast2["outdir"]), "green")
