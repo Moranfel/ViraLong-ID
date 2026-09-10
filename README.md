@@ -29,71 +29,6 @@ ViraLong-ID v6.0 expands the comparative and phylogenetic components of the pipe
 - Interactive HTML phylogeographic visualization.
 - Automatic rendering of time-scaled phylogenetic trees.
 
----
-
-## 🔬 Workflow
-
-```text
-Raw FASTQ / FASTQ.GZ
-        |
-        v
-    fastplong
-        |
-        v
-Assembly read selection
-        |
-        v
-      Flye
-        |
-        v
- BLAST target identification
-        |
-        v
- Target viral contigs
-        |
-        v
-Combined target dataset
-        |
-        v
-      MAFFT
-        |
-        v
-     trimAl
-        |
-        +---------------------------+
-        |                           |
-        v                           v
- Pairwise identity              IQ-TREE
-        |                           |
-        v                           v
- Identity matrices          ML phylogenetic tree
-        |
-        +--> Standard heatmaps
-        |
-        +--> Clustered heatmaps
-        |
-        +--> Assembled-only analysis
-
-Optional extensions:
-        |
-        +--> Assembled genomes + reference ML tree
-        |
-        +--> BEAST 2 preparation
-                 |
-                 v
-           Sampling metadata
-                 |
-                 v
-             BEAST 2
-                 |
-        +--------+---------+
-        |                  |
-        v                  v
-   MCC time tree     Phylogeographic maps
-```
-
----
-
 ### 🕰️ Optional BEAST 2 tools
 
 Required only when using `--run-beast2`:
@@ -738,8 +673,67 @@ A formal citation and DOI will be provided in a future release.
 
 ---
 
+## 🔬 Workflow
+
 ```text
-MIT License
+Raw FASTQ / FASTQ.GZ
+        |
+        v
+    fastplong
+        |
+        v
+Assembly read selection
+        |
+        v
+      Flye
+        |
+        v
+ BLAST target identification
+        |
+        v
+ Target viral contigs
+        |
+        v
+Combined target dataset
+        |
+        v
+      MAFFT
+        |
+        v
+     trimAl
+        |
+        +---------------------------+
+        |                           |
+        v                           v
+ Pairwise identity              IQ-TREE
+        |                           |
+        v                           v
+ Identity matrices          ML phylogenetic tree
+        |
+        +--> Standard heatmaps
+        |
+        +--> Clustered heatmaps
+        |
+        +--> Assembled-only analysis
+
+Optional extensions:
+        |
+        +--> Assembled genomes + reference ML tree
+        |
+        +--> BEAST 2 preparation
+                 |
+                 v
+           Sampling metadata
+                 |
+                 v
+             BEAST 2
+                 |
+        +--------+---------+
+        |                  |
+        v                  v
+   MCC time tree     Phylogeographic maps
 ```
+
+---
 
 See the repository `LICENSE` file for the complete license terms.
