@@ -104,47 +104,6 @@ treeannotator
 ```
 
 ---
-
-## 📦 Installation
-
-A Conda environment is recommended.
-
-Using the provided `environment.yml`:
-
-```bash
-conda env create -f environment.yml
-conda activate viralong-id
-```
-
-Example environment:
-
-```yaml
-name: viralong-id
-
-channels:
-  - conda-forge
-  - bioconda
-  - defaults
-
-dependencies:
-  - python=3.11
-  - biopython
-  - matplotlib
-  - cartopy
-  - ncbi-datasets-cli
-  - blast
-  - fastplong
-  - flye
-  - mafft
-  - trimal
-  - iqtree
-  - openjdk=17
-  - unzip
-  - pip
-```
-
----
-
 ## 🚀 Quick Start
 
 ```bash
