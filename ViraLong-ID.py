@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ViraLong-ID v.6.0
+ViraLong-ID v5.7
 Long-read viral identification and phylogeny pipeline.
 
 Main features
@@ -56,7 +56,7 @@ except ImportError:
 
 
 PIPELINE_NAME = "ViraLong-ID"
-PIPELINE_VERSION = "6.0-batch"
+PIPELINE_VERSION = "5.6-batch"
 
 
 # ---------------------------------------------------------------------
@@ -4074,6 +4074,7 @@ def assembled_reference_tree_outputs(shared_layout: Dict[str, Path]) -> Dict[str
         "treefile": outdir / "assembled_plus_reference.treefile",
         "iqtree": outdir / "assembled_plus_reference.iqtree",
         "pdf": outdir / "assembled_plus_reference.tree.pdf",
+        "svg": outdir / "assembled_plus_reference.tree.geographic_origin.svg",
         "summary": outdir / "assembled_plus_reference_summary.txt",
     }
 
@@ -4084,6 +4085,7 @@ def assembled_reference_tree_done(shared_layout: Dict[str, Path]) -> bool:
         outputs["treefile"].exists()
         and outputs["iqtree"].exists()
         and outputs["pdf"].exists()
+        and outputs["svg"].exists()
         and outputs["summary"].exists()
     )
 
@@ -4177,6 +4179,7 @@ def step12b_assembled_reference_tree(shared_layout: Dict[str, Path], threads: in
     if not outputs["treefile"].exists() or not outputs["iqtree"].exists():
         raise RuntimeError("Assembled-reference IQ-TREE output not found")
     render_tree_pdf(outputs["treefile"], outputs["pdf"], step2_outputs(shared_layout)[1], tree_render_mode)
+    render_tree_publication_svg(outputs["treefile"], outputs["svg"], step2_outputs(shared_layout)[1])
 
     with open(outputs["summary"], "w", encoding="utf-8") as fh:
         fh.write("Assembled contigs plus reference ML tree\n")
@@ -4193,6 +4196,7 @@ def step12b_assembled_reference_tree(shared_layout: Dict[str, Path], threads: in
         fh.write(f"Trimmed alignment: {outputs['trimmed']}\n")
         fh.write(f"Treefile: {outputs['treefile']}\n")
         fh.write(f"Tree PDF: {outputs['pdf']}\n")
+        fh.write(f"Tree geographic-origin SVG: {outputs['svg']}\n")
 
 
 # ---------------------------------------------------------------------
@@ -4811,6 +4815,7 @@ def run_pipeline(args) -> None:
         assembled_ref_outputs = assembled_reference_tree_outputs(shared_layout)
         print_status_line("Assembled + reference tree", summarize_path(assembled_ref_outputs["treefile"]), "green")
         print_status_line("Assembled + reference tree PDF", summarize_path(assembled_ref_outputs["pdf"]), "green")
+        print_status_line("Assembled + reference geographic-origin SVG", summarize_path(assembled_ref_outputs["svg"]), "green")
         print_status_line("Assembled + reference summary", summarize_path(assembled_ref_outputs["summary"]), "green")
     if args.prepare_beast2:
         beast2 = beast2_outputs(shared_layout)
