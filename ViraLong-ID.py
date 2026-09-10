@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ViraLong-ID v5.7
+ViraLong-ID v6.0
 Long-read viral identification and phylogeny pipeline.
 
 Main features
