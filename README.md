@@ -1,4 +1,4 @@
-# 🦠 ViraLong-ID v6.0
+# 🦠 ViraLong-ID v6.1
 
 **Long-read viral identification, genome reconstruction, comparative genomics and phylogenetic analysis for multi-sample ONT datasets.**
 
@@ -8,9 +8,9 @@ It processes ONT-style long-read sequencing data from raw FASTQ reads to target 
 
 ViraLong-ID also provides optional **BEAST 2 preparation and execution** for time-scaled phylogenetic and phylogeographic analyses, including automatic generation of geographic maps and time-scaled trees.
 
-## ✨ What's new in v6.0
+## ✨ What's new in v6.1
 
-ViraLong-ID v6.0 expands the comparative and phylogenetic components of the pipeline.
+ViraLong-ID v6.1: Larger text in trees and heatmaps.
 
 ### 🚀 Major additions
 
