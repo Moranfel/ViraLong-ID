@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ViraLong-ID v6.0
+ViraLong-ID v6.1
 Long-read viral identification and phylogeny pipeline.
 
 Main features
@@ -3130,7 +3130,7 @@ def render_beast2_time_tree(tree, metadata: Dict[str, Dict[str, str]],
             max_tip_date + margin * 0.25,
             y,
             tip.name or "",
-            fontsize=6.3,
+            fontsize=11,
             va="center",
             color="#b03a2e" if local else "#263238",
             fontweight="bold" if local else "normal",
@@ -3147,7 +3147,7 @@ def render_beast2_time_tree(tree, metadata: Dict[str, Dict[str, str]],
         min_tip_date,
         -0.8,
         f"Earliest sampled isolate: {min_tip_date:.2f}",
-        fontsize=8,
+        fontsize=11,
         color="#5d6d7e",
         ha="left",
         va="bottom",
@@ -3156,7 +3156,7 @@ def render_beast2_time_tree(tree, metadata: Dict[str, Dict[str, str]],
         Line2D([0], [0], color="#b03a2e", lw=1.6, marker="o", markersize=5, label="Local isolates"),
         Line2D([0], [0], color="#5d6d7e", lw=1.2, marker="o", markersize=4, label="Reference genomes"),
     ]
-    ax.legend(handles=legend_handles, loc="upper left", frameon=False, fontsize=9)
+    ax.legend(handles=legend_handles, loc="upper left", frameon=False, fontsize=15)
     fig.tight_layout()
     fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
     fig.savefig(str(png_path), format="png", dpi=300, bbox_inches="tight")
@@ -3343,14 +3343,15 @@ def render_identity_heatmap(labels: List[str], matrix: List[List[float]], pdf_pa
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
     display_labels = [clean_tree_display_label(label) for label in labels]
-    ax.set_xticklabels(display_labels, rotation=90, fontsize=8)
-    ax.set_yticklabels(display_labels, fontsize=8)
+    ax.set_xticklabels(display_labels, rotation=90, fontsize=13)
+    ax.set_yticklabels(display_labels, fontsize=13)
     ax.set_xticks([x - 0.5 for x in range(1, n)], minor=True)
     ax.set_yticks([y - 0.5 for y in range(1, n)], minor=True)
     ax.grid(which="minor", color="white", linestyle="-", linewidth=0.8)
     ax.tick_params(which="minor", bottom=False, left=False)
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Genome identity (%)")
+    cbar.set_label("Genome identity (%)", fontsize=16, labelpad=12)
+    cbar.ax.tick_params(labelsize=14)
     fig.tight_layout()
     fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
     fig.savefig(str(png_path), format="png", dpi=300, bbox_inches="tight")
@@ -3468,7 +3469,7 @@ def render_clustered_identity_heatmap(labels: List[str], matrix: List[List[float
         4,
         3,
         width_ratios=[1.4, 0.18, 10],
-        height_ratios=[0.75, 1.45, 0.18, 10],
+        height_ratios=[3.0, 1.45, 0.18, 10],
         wspace=0.02,
         hspace=0.02,
     )
@@ -3564,9 +3565,9 @@ def render_clustered_identity_heatmap(labels: List[str], matrix: List[List[float
     im = ax.imshow(clustered_matrix, cmap="viridis", vmin=vmin, vmax=100.0, interpolation="nearest", aspect="auto")
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
-    label_fontsize = 8.5 if n > 100 else 10.0
+    label_fontsize = 12.0 if n > 100 else 14.0
     display_labels = [clean_tree_display_label(label) for label in clustered_labels]
-    ax.set_xticklabels(display_labels, rotation=90, fontsize=max(7.5, label_fontsize - 1.0))
+    ax.set_xticklabels(display_labels, rotation=90, fontsize=label_fontsize)
     ax.set_yticklabels(display_labels, fontsize=label_fontsize)
     ax.yaxis.tick_right()
     ax.yaxis.set_label_position("right")
@@ -3575,24 +3576,22 @@ def render_clustered_identity_heatmap(labels: List[str], matrix: List[List[float
     ax.set_yticks([y - 0.5 for y in range(1, n)], minor=True)
     ax.grid(which="minor", color="white", linestyle="-", linewidth=0.6)
     ax.tick_params(which="minor", bottom=False, left=False)
-    cax = ax_legend.inset_axes([0.00, 0.28, 0.22, 0.22])
+    cax = ax_legend.inset_axes([0.00, 0.55, 0.22, 0.18])
     cbar = fig.colorbar(im, cax=cax, orientation="horizontal")
-    cbar.set_label("Genome identity (%)", fontsize=11, fontweight="bold", labelpad=4)
-    cbar.ax.tick_params(labelsize=9, length=0)
+    cbar.set_label("Genome identity (%)", fontsize=16, fontweight="bold", labelpad=8)
+    cbar.ax.tick_params(labelsize=14, length=0)
 
     countries = []
     for label in clustered_labels:
         country = infer_identity_label_country(label)
         if country not in countries:
             countries.append(country)
-    x = 0.30
-    y = 0.43
-    for country in countries:
-        ax_legend.add_patch(Rectangle((x, y - 0.06), 0.018, 0.12, transform=ax_legend.transAxes,
-                                      color=colors.get(country, colors["Other"]), clip_on=False))
-        ax_legend.text(x + 0.026, y, country, transform=ax_legend.transAxes,
-                       va="center", ha="left", fontsize=10.5)
-        x += 0.12 if country != "South Korea" else 0.16
+    # Let Matplotlib size and space legend entries from their actual text.
+    handles = [Rectangle((0, 0), 1, 1, color=colors.get(country, colors["Other"]),
+                         label=country) for country in countries]
+    ax_legend.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.29, 1.0),
+                     ncol=2, frameon=False, fontsize=16, handlelength=1.2,
+                     columnspacing=1.5, labelspacing=0.6, borderaxespad=0)
     fig.savefig(str(pdf_path), format="pdf", bbox_inches="tight")
     fig.savefig(str(png_path), format="png", dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -3809,9 +3808,9 @@ def render_tree_pdf(treefile: Path, pdf_path: Path, metadata_tsv: Path | None = 
     terminals = max(1, len(display_tree.get_terminals()))
     fig_width = max(26, min(96, terminals * 0.70 if render_mode == "cladogram" else terminals * 0.95))
     fig_height = max(24, min(210, terminals * 1.48))
-    tip_font_size = max(17.8, min(19.6, 22.5 - terminals * 0.02))
-    sample_font_size = min(22.8, tip_font_size + 2.2)
-    bootstrap_font_size = max(14.0, min(16.2, tip_font_size - 1.4))
+    tip_font_size = max(25.0, min(29.0, 32.0 - terminals * 0.02))
+    sample_font_size = tip_font_size + 3.0
+    bootstrap_font_size = max(18.0, tip_font_size - 6.0)
 
     fig = plt.figure(figsize=(fig_width, fig_height))
     ax = fig.add_subplot(1, 1, 1)
@@ -3879,10 +3878,10 @@ def render_tree_pdf(treefile: Path, pdf_path: Path, metadata_tsv: Path | None = 
         loc="upper left",
         bbox_to_anchor=(1.01, 1.0),
         frameon=False,
-        fontsize=max(19, tip_font_size + 2.4),
+        fontsize=max(30, tip_font_size + 5.0),
         handletextpad=0.8,
         labelspacing=0.65,
-        markerscale=1.2,
+        markerscale=1.8,
     )
     ax.set_title("Maximum-likelihood phylogeny", fontsize=max(22, tip_font_size + 5), fontweight="bold", pad=18)
     ax.set_ylabel("")
@@ -3939,14 +3938,14 @@ def render_tree_publication_svg(treefile: Path, svg_path: Path, metadata_tsv: Pa
         depths = tree.depths()
         max_depth = max((depths.get(tip, 0.0) for tip in terminals), default=1.0)
 
-    y_step = 32.0
+    y_step = 42.0
     margin_top = 162.0
     margin_left = 105.0
     margin_bottom = 105.0
     tree_width = 920.0
     labels_x = margin_left + tree_width + 42.0
-    tip_font = 19.0
-    bootstrap_font = 14.0
+    tip_font = 27.0
+    bootstrap_font = 18.0
 
     y_cursor = margin_top
 
@@ -3966,7 +3965,7 @@ def render_tree_publication_svg(treefile: Path, svg_path: Path, metadata_tsv: Pa
 
     cleaned_labels = [clean_tree_display_label(tip.name or "") for tip in terminals]
     max_label_chars = max((len(label) for label in cleaned_labels), default=60)
-    label_width = max(1020.0, min(1660.0, max_label_chars * 10.0))
+    label_width = max(1020.0, max_label_chars * tip_font * 0.65)
     width = int(labels_x + label_width + 135.0)
     height = int(margin_top + y_step * len(terminals) + margin_bottom)
 
@@ -3983,9 +3982,9 @@ def render_tree_publication_svg(treefile: Path, svg_path: Path, metadata_tsv: Pa
         if any(tree_label_country_from_map(tip.name or "", reference_countries) == country for tip in terminals)
     ]
     for country in legend_order:
-        parts.append(f'<circle cx="{legend_x:.1f}" cy="{legend_y:.1f}" r="9.5" fill="{colors.get(country, colors["Other"])}"/>')
-        parts.append(f'<text x="{legend_x + 21:.1f}" y="{legend_y + 7.0:.1f}" font-family="Arial, sans-serif" font-size="21">{svg_escape(country)}</text>')
-        legend_x += 205.0 if country == "South Korea" else 146.0
+        parts.append(f'<circle cx="{legend_x:.1f}" cy="{legend_y:.1f}" r="12" fill="{colors.get(country, colors["Other"])}"/>')
+        parts.append(f'<text x="{legend_x + 21:.1f}" y="{legend_y + 7.0:.1f}" font-family="Arial, sans-serif" font-size="30">{svg_escape(country)}</text>')
+        legend_x += max(155.0, len(country) * 19.0 + 55.0)
 
     def draw_branches(clade):
         if not clade.clades:
@@ -4023,7 +4022,7 @@ def render_tree_publication_svg(treefile: Path, svg_path: Path, metadata_tsv: Pa
         parts.append(f'<line x1="{scale_x0:.1f}" y1="{scale_y}" x2="{scale_x0 + scale_pixels:.1f}" y2="{scale_y}" stroke="#222" stroke-width="1.4"/>')
         parts.append(f'<line x1="{scale_x0:.1f}" y1="{scale_y - 4}" x2="{scale_x0:.1f}" y2="{scale_y + 4}" stroke="#222" stroke-width="1.4"/>')
         parts.append(f'<line x1="{scale_x0 + scale_pixels:.1f}" y1="{scale_y - 4}" x2="{scale_x0 + scale_pixels:.1f}" y2="{scale_y + 4}" stroke="#222" stroke-width="1.4"/>')
-        parts.append(f'<text x="{scale_x0 + scale_pixels / 2:.1f}" y="{scale_y + 22}" text-anchor="middle" font-family="Arial, sans-serif" font-size="12">0.01 substitutions/site</text>')
+        parts.append(f'<text x="{scale_x0 + scale_pixels / 2:.1f}" y="{scale_y + 22}" text-anchor="middle" font-family="Arial, sans-serif" font-size="18">0.01 substitutions/site</text>')
 
     parts.append("</svg>")
     svg_path.write_text("\n".join(parts), encoding="utf-8")
